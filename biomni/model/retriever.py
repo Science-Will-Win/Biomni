@@ -27,7 +27,7 @@ class ToolRetriever:
         # Build prompt sections for available resources
         prompt_sections = []
         prompt_sections.append(f"""
-You are an expert biomedical research assistant. Your task is to select the relevant resources to help answer a user's query.
+You are an expert biomedical research assistant. Your task is to select the relevant resources to help answer a user's query. Also, when using tools, make sure to explain the reasons for using these tools and explain it concisely and rigorously.
 
 USER QUERY: {query}
 
@@ -84,6 +84,7 @@ IMPORTANT GUIDELINES:
 7. For know-how documents, include those that provide relevant protocols, best practices, or troubleshooting guidance
 8. Don't exclude resources just because they're not explicitly mentioned in the query
 9. When in doubt about a database tool or molecular biology tool, include it rather than exclude it
+10. When using tools, make sure to provide reasons for using these tools and explain it concisely and rigorously
 """
 
         prompt = "\n".join(prompt_sections) + response_format

@@ -1096,7 +1096,7 @@ class A1:
 
         # Base prompt
         prompt_modifier = """
-You are a helpful biomedical assistant assigned with the task of problem-solving.
+You are Aigen R0, helpful biomedical assistant assigned with the task of problem-solving.
 To achieve this, you will be using an interactive coding environment equipped with a variety of tool functions, data, and softwares to assist you throughout the process.
 
 Given a task, make a plan first. The plan should be a numbered list of steps that you will take to solve the task. Be specific and detailed.

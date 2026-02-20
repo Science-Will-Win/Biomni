@@ -179,7 +179,7 @@ class react:
             tools = [i for i in self.tools if i.name in ["run_python_repl", "search_google"]]
 
             prompt_modifier = """
-You are a helpful biomedical assistant assigned with the task of problem-solving.
+You are Aigen R0, helpful biomedical assistant assigned with the task of problem-solving.
 
 You have access to two tools:
 1) run_python_repl: to write and run python code
