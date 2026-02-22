@@ -13,6 +13,9 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
+from langchain_core.runnables import RunnableConfig
+from langchain_core.callbacks import Callbacks
+from langfuse.decorators import observe, langfuse_context
 
 from biomni.config import default_config
 from biomni.know_how import KnowHowLoader
@@ -1285,6 +1288,30 @@ Each library is listed with its description to help you understand its functiona
         formatted_prompt = prompt_modifier.format(**format_dict)
 
         return formatted_prompt
+    
+    # 🌟 1. A1 클래스의 메서드로 새로 추가 (configure 메서드 위나 아래에 배치)
+    @observe(name="Run Sandbox Code")
+    def _traced_run_code(self, code: str, timeout: int):
+        # 파이썬/R/Bash 실행에 필요한 모듈들이 파일 상단에 import 되어있다고 가정합니다.
+        # (run_with_timeout, run_r_code, run_bash_script, run_python_repl 등)
+        
+        if code.strip().startswith("#!R") or code.strip().startswith("# R code") or code.strip().startswith("# R script"):
+            r_code = re.sub(r"^#!R|^# R code|^# R script", "", code, count=1).strip()
+            return run_with_timeout(run_r_code, [r_code], timeout=timeout)
+        
+        elif code.strip().startswith("#!BASH") or code.strip().startswith("# Bash script") or code.strip().startswith("#!CLI"):
+            if code.strip().startswith("#!CLI"):
+                cli_command = re.sub(r"^#!CLI", "", code, count=1).strip().replace("\n", " ")
+                return run_with_timeout(run_bash_script, [cli_command], timeout=timeout)
+            else:
+                bash_script = re.sub(r"^#!BASH|^# Bash script", "", code, count=1).strip()
+                return run_with_timeout(run_bash_script, [bash_script], timeout=timeout)
+        
+        else:
+            # self를 통해 A1 클래스의 다른 메서드 호출
+            self._clear_execution_plots()
+            self._inject_custom_functions_to_repl()
+            return run_with_timeout(run_python_repl, [code], timeout=timeout)
 
     def configure(self, self_critic=False, test_time_scale_round=0):
         """Configure the agent with the initial system prompt and workflow.
@@ -1378,7 +1405,7 @@ Each library is listed with its description to help you understand its functiona
         )
 
         # Define the nodes
-        def generate(state: AgentState) -> AgentState:
+        def generate(state: AgentState, config: RunnableConfig) -> AgentState:
             # Add OpenAI-specific formatting reminders if using OpenAI models
             system_prompt = self.system_prompt
             if hasattr(self.llm, "model_name") and (
@@ -1387,7 +1414,7 @@ Each library is listed with its description to help you understand its functiona
                 system_prompt += "\n\nIMPORTANT FOR GPT MODELS: You MUST use XML tags <execute> or <solution> in EVERY response. Do not use markdown code blocks (```) - use <execute> tags instead."
 
             messages = [SystemMessage(content=system_prompt)] + state["messages"]
-            response = self.llm.invoke(messages)
+            response = self.llm.invoke(messages, config=config) # config 전달로 LLM 트레이싱 연동
 
             # Normalize Responses API content blocks (list of dicts) into a plain string
             content = response.content
@@ -1467,8 +1494,9 @@ Each library is listed with its description to help you understand its functiona
                     )
                     state["next_step"] = "generate"
             return state
-
-        def execute(state: AgentState) -> AgentState:
+        
+        # 🌟 2. 기존 configure 내부의 execute 함수 수정
+        def execute(state: AgentState, config: RunnableConfig) -> AgentState:
             last_message = state["messages"][-1].content
             # Only add the closing tag if it's not already there
             if "<execute>" in last_message and "</execute>" not in last_message:
@@ -1481,42 +1509,9 @@ Each library is listed with its description to help you understand its functiona
                 # Set timeout duration (10 minutes = 600 seconds)
                 timeout = self.timeout_seconds
 
-                # Check if the code is R code
-                if (
-                    code.strip().startswith("#!R")
-                    or code.strip().startswith("# R code")
-                    or code.strip().startswith("# R script")
-                ):
-                    # Remove the R marker and run as R code
-                    r_code = re.sub(r"^#!R|^# R code|^# R script", "", code, count=1).strip()
-                    result = run_with_timeout(run_r_code, [r_code], timeout=timeout)
-                # Check if the code is a Bash script or CLI command
-                elif (
-                    code.strip().startswith("#!BASH")
-                    or code.strip().startswith("# Bash script")
-                    or code.strip().startswith("#!CLI")
-                ):
-                    # Handle both Bash scripts and CLI commands with the same function
-                    if code.strip().startswith("#!CLI"):
-                        # For CLI commands, extract the command and run it as a simple bash script
-                        cli_command = re.sub(r"^#!CLI", "", code, count=1).strip()
-                        # Remove any newlines to ensure it's a single command
-                        cli_command = cli_command.replace("\n", " ")
-                        result = run_with_timeout(run_bash_script, [cli_command], timeout=timeout)
-                    else:
-                        # For Bash scripts, remove the marker and run as a bash script
-                        bash_script = re.sub(r"^#!BASH|^# Bash script", "", code, count=1).strip()
-                        result = run_with_timeout(run_bash_script, [bash_script], timeout=timeout)
-                # Otherwise, run as Python code
-                else:
-                    # Clear any previous plots before execution
-                    self._clear_execution_plots()
-
-                    # Inject custom functions into the Python execution environment
-                    self._inject_custom_functions_to_repl()
-                    result = run_with_timeout(run_python_repl, [code], timeout=timeout)
-
-                    # Plots are now captured directly in the execution entry above
+                # 기존에 길었던 코드가 아래 한 줄로 깔끔해집니다.
+                # 이 함수가 실행되면서 Langfuse로 상세 실행 기록이 전송됩니다.
+                result = self._traced_run_code(code, timeout)
 
                 if len(result) > 10000:
                     result = (
@@ -1643,7 +1638,9 @@ Each library is listed with its description to help you understand its functiona
         self.app.checkpointer = self.checkpointer
         # display(Image(self.app.get_graph().draw_mermaid_png()))
 
-    def _prepare_resources_for_retrieval(self, prompt):
+    # 🌟 1. 이 함수 전체를 "Tool Retrieval"이라는 이름의 블록으로 추적하겠다고 선언!
+    @observe(name="Tool Retrieval")
+    def _prepare_resources_for_retrieval(self, prompt, callbacks=None): # 🌟 2. 파라미터 추가
         """Prepare resources for retrieval and return selected resource names.
 
         Args:
@@ -1698,8 +1695,17 @@ Each library is listed with its description to help you understand its functiona
             "know_how": know_how_summaries,
         }
 
+        # 🌟 3. LLM에게 검색을 맡길 때, 우리가 받아온 CCTV(콜백)를 LLM에 붙여줍니다.
+        # 이렇게 해야 검색 과정에서 소모된 토큰이 Langfuse 비용 계산에 포함됩니다.
+        llm_for_retrieval = self.llm
+        if callbacks:
+            # langchain의 with_config를 쓰면 기존 LLM에 콜백만 덧붙일 수 있습니다.
+            llm_for_retrieval = self.llm.with_config({"callbacks": callbacks})
+
+        # 기존 self.llm 대신 방금 만든 llm_for_retrieval을 사용합니다.
         # Use prompt-based retrieval with the agent's LLM
-        selected_resources = self.retriever.prompt_based_retrieval(prompt, resources, llm=self.llm)
+        selected_resources = self.retriever.prompt_based_retrieval(prompt, resources, llm=llm_for_retrieval)
+        
         print("\n" + "=" * 60)
         print("🔍 RESOURCE RETRIEVAL")
         print("=" * 60)
@@ -1756,7 +1762,7 @@ Each library is listed with its description to help you understand its functiona
 
         return selected_resources_names
 
-    def go(self, prompt):
+    def go(self, prompt: str, callbacks: Callbacks = None):
         """Execute the agent with the given prompt.
 
         Args:
@@ -1767,11 +1773,13 @@ Each library is listed with its description to help you understand its functiona
         self.user_task = prompt
 
         if self.use_tool_retriever:
-            selected_resources_names = self._prepare_resources_for_retrieval(prompt)
+            selected_resources_names = self._prepare_resources_for_retrieval(prompt, callbacks=callbacks)
             self.update_system_prompt_with_selected_resources(selected_resources_names)
 
         inputs = {"messages": [HumanMessage(content=prompt)], "next_step": None}
         config = {"recursion_limit": 500, "configurable": {"thread_id": 42}}
+        if callbacks:
+            config["callbacks"] = callbacks # LangGraph 스트림에 콜백 등록
         self.log = []
 
         # Store the final conversation state for markdown generation
@@ -1788,7 +1796,7 @@ Each library is listed with its description to help you understand its functiona
 
         return self.log, message.content
 
-    def go_stream(self, prompt) -> Generator[dict, None, None]:
+    def go_stream(self, prompt: str, callbacks: Callbacks = None) -> Generator[dict, None, None]:
         """Execute the agent with the given prompt and return a generator that yields each step.
 
         This function returns a generator that yields each step of the agent's execution,
@@ -1804,11 +1812,13 @@ Each library is listed with its description to help you understand its functiona
         self.user_task = prompt
 
         if self.use_tool_retriever:
-            selected_resources_names = self._prepare_resources_for_retrieval(prompt)
+            selected_resources_names = self._prepare_resources_for_retrieval(prompt, callbacks=callbacks)
             self.update_system_prompt_with_selected_resources(selected_resources_names)
 
         inputs = {"messages": [HumanMessage(content=prompt)], "next_step": None}
         config = {"recursion_limit": 500, "configurable": {"thread_id": 42}}
+        if callbacks:
+            config["callbacks"] = callbacks # LangGraph 스트림에 콜백 등록
         self.log = []
 
         # Store the final conversation state for markdown generation
