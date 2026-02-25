@@ -229,7 +229,7 @@ You can use them to solve the problem.
                 You have access to write_python_code and run_python_repl tool to write and run your own code if tools fail, or if the given tools are not enough. Please always make sure to write code when dealing with substantial data, including finding the length of long sequences or elements at different positions.
                 """
         prompt_modifier += f"\n{tool_import_instructions}"
-        
+
         if data_lake:
             # Format data lake items with descriptions
             data_lake_formatted = []
@@ -239,6 +239,10 @@ You can use them to solve the problem.
 
             prompt_modifier += """
 You can also access a biological data lake at the following path: {data_lake_path}. You can use the run_python_repl tool to write code to understand the data, process and utilize it for the task.
+
+CRITICAL RULE FOR DATASETS: 
+Never guess column names. Before extracting specific columns from any dataset (.parquet, .pkl, .csv), you MUST write a python code snippet to print `df.columns` and `df.head(2)` to accurately verify the column schema.
+
 Here is the list of datasets with their descriptions:
 ----
 {data_lake_formatted}
