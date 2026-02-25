@@ -2781,9 +2781,9 @@ def query_gnomad(
         return {"error": "Either a prompt or a gene_symbol must be provided"}
 
     # If using prompt, parse with Claude
+    schema_path = os.path.join(os.path.dirname(__file__), "schema_db", "gnomad.pkl")
     if prompt and not gene_symbol:
         # Load gnomAD schema
-        schema_path = os.path.join(os.path.dirname(__file__), "schema_db", "gnomad.pkl")
         with open(schema_path, "rb") as f:
             gnomad_schema = pickle.load(f)
 
