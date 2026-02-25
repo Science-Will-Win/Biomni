@@ -2701,7 +2701,10 @@ def query_gwas_catalog(
         3. "description": A brief description of what the query is doing
 
         SPECIAL NOTES:
-        - For disease/trait searches, consider using the "EFO" identifiers when possible
+        - For disease/trait searches, consider using the "EFO" identifiers when possible.
+        - IMPORTANT SEARCH STRATEGY: If the phenotype is a long or highly specific string (e.g., "creatinine levels" or "cholesteryl esters..."), do NOT assume an exact string match will work in standard endpoints.
+          -> Strategy 1: First, query the "efoTraits" endpoint with a simplified keyword (e.g., "creatinine") using the "query" parameter (e.g., `params: {{"query": "creatinine"}}`) to find the exact EFO trait ID.
+          -> Strategy 2: If searching traits directly, extract only the core root words (e.g., use "cholesterol" instead of the full sentence) to maximize finding results.
         - Common endpoints include: "studies", "associations", "singleNucleotidePolymorphisms", "efoTraits"
         - For pagination, use "size" and "page" parameters
         - For filtering by p-value, use "pvalueMax" parameter
