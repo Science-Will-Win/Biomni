@@ -175,6 +175,20 @@ class react:
         data_lake_content = glob.glob(data_lake_path + "/*")
         data_lake_items = [x.split("/")[-1] for x in data_lake_content]
 
+        import_guide_lines = []
+        for module, api_list in self.module2api.items():
+            func_names = ", ".join([api['name'] for api in api_list])
+            import_guide_lines.append(f"from {module} import {func_names}")
+        import_guide_str = "\n".join(import_guide_lines)
+
+        tool_import_instructions = f"""
+        CRITICAL IMPORT INSTRUCTIONS:
+        When using python code to run biomni tools (such as advanced_web_search_claude, search_protocols, etc.), 
+        you MUST explicitly import them from their exact module paths. Do NOT guess the module names.
+        Use the following imports when needed:
+        {import_guide_str}
+        """
+
         if react_code_search:
             tools = [i for i in self.tools if i.name in ["run_python_repl", "search_google"]]
 
@@ -214,7 +228,8 @@ You can use them to solve the problem.
                 In each round after the tool is used, conduct "reflection" step: reflect on the current state of the problem and the results of the last round. What does the observation mean? If there is an error, what caused the error and how to debug?
                 You have access to write_python_code and run_python_repl tool to write and run your own code if tools fail, or if the given tools are not enough. Please always make sure to write code when dealing with substantial data, including finding the length of long sequences or elements at different positions.
                 """
-
+        prompt_modifier += f"\n{tool_import_instructions}"
+        
         if data_lake:
             # Format data lake items with descriptions
             data_lake_formatted = []
