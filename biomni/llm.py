@@ -47,7 +47,7 @@ def get_llm(
 
     # Use defaults if still not specified
     if model is None:
-        model = "claude-3-5-sonnet-20241022"
+        model = "gpt-4o"
     if temperature is None:
         temperature = 0.7
     if api_key is None:
