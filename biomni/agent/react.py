@@ -242,6 +242,7 @@ You can also access a biological data lake at the following path: {data_lake_pat
 
 CRITICAL RULE FOR DATASETS: 
 Never guess column names. Before extracting specific columns from any dataset (.parquet, .pkl, .csv), you MUST write a python code snippet to print `df.columns` and `df.head(2)` to accurately verify the column schema.
+CRITICAL: Do NOT write the data processing logic in the same step. You MUST execute the schema check first, wait for the observation, and then proceed with the actual processing in the next step based on the accurate column names.
 
 Here is the list of datasets with their descriptions:
 ----
