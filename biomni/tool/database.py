@@ -99,31 +99,21 @@ def _query_llm_for_api(prompt, schema, system_template):
         return {"success": True, "data": result, "raw_response": llm_text}
 
     except (json.JSONDecodeError, KeyError, IndexError) as e:
-        print(f"🚨 로컬 모델이 API Schema 파싱에 실패했습니다({e}). GPT-4o로 우회(Fallback)를 시도합니다.")
+        # Try ast.literal_eval for Python-style dict (single quotes from local models)
+        import ast
         try:
-            # 1. GPT-4o로 Fallback 호출
-            fallback_llm = get_llm(model="gpt-4o", source="OpenAI")
-            fallback_response = fallback_llm.invoke(messages)
-            fallback_text = fallback_response.content.strip()
-
-            # 2. JSON 파싱 재시도
-            json_start = fallback_text.find("{")
-            json_end = fallback_text.rfind("}") + 1
-
             if json_start >= 0 and json_end > json_start:
-                json_text = fallback_text[json_start:json_end]
-                result = json.loads(json_text)
+                result = ast.literal_eval(llm_text[json_start:json_end])
             else:
-                result = json.loads(fallback_text)
-
-            return {"success": True, "data": result, "raw_response": fallback_text}
-
-        except Exception as fallback_e:
-            return {
-                "success": False,
-                "error": f"Fallback to GPT also failed: {str(fallback_e)}",
-                "raw_response": fallback_text if "fallback_text" in locals() else "No content found",
-            }
+                result = ast.literal_eval(llm_text)
+            return {"success": True, "data": result, "raw_response": llm_text}
+        except Exception:
+            pass
+        return {
+            "success": False,
+            "error": f"API Schema parsing failed: {str(e)}",
+            "raw_response": llm_text if "llm_text" in locals() else "",
+        }
     except Exception as e:
         return {"success": False, "error": f"Error querying LLM: {str(e)}"}
 

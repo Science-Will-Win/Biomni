@@ -270,6 +270,7 @@ def get_llm(
             base_url=base_url,
             api_key=api_key,
             streaming=True,
+            model_kwargs={"extra_body": {"skip_special_tokens": False}},
         )
         return llm
 

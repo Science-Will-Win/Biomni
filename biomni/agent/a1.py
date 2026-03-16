@@ -56,6 +56,8 @@ class AgentState(TypedDict):
     messages: list[BaseMessage]
     next_step: str | None
     tool_calls: list[dict] | None  # bind_tools 모드에서 사용
+    current_step_number: int | None      # 1-based step index for checklist detection
+    is_final_step: bool | None           # True if this is the last step in the plan
 
 
 class A1:
@@ -225,7 +227,49 @@ class A1:
 
         # Add timeout parameter
         self.timeout_seconds = timeout_seconds  # 10 minutes default timeout
+
+        # Default token format (backward-compatible)
+        self._exec_open = "<execute>"
+        self._exec_close = "</execute>"
+        self._sol_open = "<solution>"
+        self._sol_close = "</solution>"
+        self._think_open = "<think>"
+        self._think_close = "</think>"
+        self._obs_open = "<observation>"
+        self._obs_close = "</observation>"
+
         self.configure()
+
+    def set_token_format(self, behavior: dict):
+        """Set token format from external behavior config (e.g., chat_handler)."""
+        def _close(tag: str) -> str:
+            if tag.startswith("["):
+                return tag.replace("[", "[/", 1)
+            return tag.replace("<", "</", 1)
+
+        exec_fmt = behavior.get("code_execute_format") or "<execute>"
+        sol_fmt = behavior.get("solution_format") or ""
+        think_fmt = behavior.get("think_format") or "<think>"
+        obs_fmt = behavior.get("code_result_format") or "<observation>"
+
+        self._exec_open = exec_fmt
+        self._exec_close = _close(exec_fmt)
+        self._sol_open = sol_fmt
+        self._sol_close = _close(sol_fmt) if sol_fmt else ""
+        self._think_open = think_fmt
+        self._think_close = _close(think_fmt)
+        self._obs_open = obs_fmt
+        self._obs_close = _close(obs_fmt)
+
+        # Update LLM stop sequences to match new format
+        if hasattr(self, 'llm'):
+            stops = [self._exec_close]
+            if sol_fmt and sol_fmt != self._exec_open:
+                stops.append(self._sol_close)
+            for attr in ('stop', 'stop_sequences'):
+                if hasattr(self.llm, attr):
+                    setattr(self.llm, attr, stops)
+                    break
 
     def add_tool(self, api):
         """Add a new tool to the agent's tool registry and make it available for retrieval.
@@ -1438,15 +1482,28 @@ For example: from [module_name] import [function_name]"""
         # [수정] 2. Generate(Execute) 전용 노드
         # ==========================================
         def generate(state: AgentState, config: RunnableConfig) -> AgentState:
-            # GPT 모델용 추가 지시어 처리
-            sys_prompt = self.execute_prompt
-            if hasattr(self.llm, "model_name") and (
-                "gpt" in str(self.llm.model_name).lower() or "openai" in str(type(self.llm)).lower()
-            ):
-                sys_prompt += "\n\nIMPORTANT FOR GPT MODELS: You MUST use XML tags <execute> or <solution> in EVERY response. Do not use markdown code blocks (```) - use <execute> tags instead."
+            # Prefer externally-set system_prompt (parameterized by chat_handler)
+            sys_prompt = getattr(self, 'system_prompt', None) or self.execute_prompt
+            # GPT/o1/o3 models only — exclude vLLM local models that also use ChatOpenAI
+            _mn = str(getattr(self.llm, "model_name", "")).lower()
+            if any(k in _mn for k in ("gpt", "o1", "o3")):
+                sol_hint = f" or {self._sol_open}" if self._sol_open else ""
+                sys_prompt += (
+                    f"\n\nIMPORTANT: You MUST use {self._exec_open}{sol_hint} tags in EVERY response. "
+                    f"Do not use markdown code blocks (```) - use {self._exec_open} tags instead."
+                )
 
             messages = [SystemMessage(content=sys_prompt)] + state["messages"]
-            response = self.llm.invoke(messages, config=config) 
+
+            # vLLM/SGLang requires last message to be HumanMessage for generation
+            if messages and isinstance(messages[-1], AIMessage):
+                messages.append(HumanMessage(content="Continue. Execute code or mark the step as complete."))
+
+            # Pass stop sequences at invocation time (setattr on Pydantic model doesn't propagate to API calls)
+            stop_seqs = [self._exec_close]
+            if self._sol_close and self._sol_close != self._exec_close:
+                stop_seqs.append(self._sol_close)
+            response = self.llm.invoke(messages, config=config, stop=stop_seqs)
 
             # (중략된 파싱 로직 시작) - 기존 코드와 동일하게 유지
             content = response.content
@@ -1472,32 +1529,22 @@ For example: from [module_name] import [function_name]"""
                 if not previous_was_loop_warning:
                     print("🚨 무한 추론 루프 1차 감지!")
                     state["messages"].append(AIMessage(content=msg[:500] + "\n... [LOOP TRUNCATED]"))
-                    state["messages"].append(HumanMessage(content="System Alert: Infinite loop detected. Stop repeating. Please evaluate your last step and provide a new, concise plan with a single <execute> or <solution> block."))
+                    state["messages"].append(HumanMessage(content=f"System Alert: Infinite loop detected. Stop repeating. Please evaluate your last step and provide a new, concise plan with a single {self._exec_open} or {self._sol_open} block."))
                     state["next_step"] = "generate"
                     return state
                 else:
-                    print("🚨 무한 추론 루프 2차 감지! GPT-4o Fallback")
-                    try:
-                        fallback_llm = get_llm(model="gpt-4o", source="OpenAI")
-                        fallback_prompt = "System Alert: The primary agent got stuck in an infinite loop. Please review the system instructions, the original user request, and the last observation. Provide the correct next step. You MUST output EITHER <execute> python code here </execute> OR <solution> direct answer </solution>."
-                        
-                        sys_msg = SystemMessage(content=self.execute_prompt)
-                        user_prompt = state["messages"][0]
-                        last_observation = state["messages"][-2] if len(state["messages"]) > 2 else state["messages"][0]
-                        
-                        fallback_messages = [sys_msg, user_prompt, last_observation, HumanMessage(content=fallback_prompt)]
-                        fallback_response = fallback_llm.invoke(fallback_messages)
-                        msg = fallback_response.content
-                    except Exception as e:
-                        print(f"Fallback failed: {e}")
+                    print("🚨 무한 추론 루프 2차 감지! Stopping step.")
+                    state["messages"].append(AIMessage(content="[Error] Infinite reasoning loop detected. Stopping."))
+                    state["next_step"] = "end"
+                    return state
 
-            if "<execute>" in msg and "</execute>" not in msg: msg += "</execute>"
-            if "<solution>" in msg and "</solution>" not in msg: msg += "</solution>"
-            if "<think>" in msg and "</think>" not in msg: msg += "</think>"
+            if self._exec_open in msg and self._exec_close not in msg: msg += self._exec_close
+            if self._sol_open in msg and self._sol_close not in msg: msg += self._sol_close
+            if self._think_open in msg and self._think_close not in msg: msg += self._think_close
 
-            think_match = re.search(r"<think>(.*?)</think>", msg, re.DOTALL | re.IGNORECASE)
-            execute_match = re.search(r"<execute>(.*?)</execute>", msg, re.DOTALL | re.IGNORECASE)
-            answer_match = re.search(r"<solution>(.*?)</solution>", msg, re.DOTALL | re.IGNORECASE)
+            think_match = re.search(re.escape(self._think_open) + r'(.*?)' + re.escape(self._think_close), msg, re.DOTALL | re.IGNORECASE)
+            execute_match = re.search(re.escape(self._exec_open) + r'(.*?)' + re.escape(self._exec_close), msg, re.DOTALL | re.IGNORECASE)
+            answer_match = re.search(re.escape(self._sol_open) + r'(.*?)' + re.escape(self._sol_close), msg, re.DOTALL | re.IGNORECASE)
 
             if not execute_match:
                 code_block_match = re.search(r"```(?:python|bash|r)?\s*(.*?)```", msg, re.DOTALL)
@@ -1506,7 +1553,20 @@ For example: from [module_name] import [function_name]"""
 
             state["messages"].append(AIMessage(content=msg.strip()))
 
+            # ── Checklist completion detection ──
+            checklist_done = False
+            step_num = state.get("current_step_number")
+            if step_num is not None:
+                # Primary: numbered format "3. [✓]"
+                pattern = rf'(?:^|\n)\s*{step_num}\.\s*\[(?:✓|x|X|✗|v|V)\]'
+                if re.search(pattern, msg):
+                    checklist_done = True
+                # Fallback: unnumbered [✓] or [✗] (Unicode only to avoid false positives with [x] in code)
+                elif not execute_match and re.search(r'\[(?:✓|✗)\]', msg):
+                    checklist_done = True
+
             if answer_match: state["next_step"] = "end"
+            elif checklist_done: state["next_step"] = "end"
             elif execute_match: state["next_step"] = "execute"
             elif think_match: state["next_step"] = "generate"
             else:
@@ -1516,35 +1576,21 @@ For example: from [module_name] import [function_name]"""
                     state["next_step"] = "end"
                     state["messages"].append(AIMessage(content="Execution terminated due to repeated parsing errors."))
                 else:
-                    state["messages"].append(HumanMessage(content="Each response must include thinking process followed by either <execute> or <solution> tag. But there are no tags in the current response. Please follow the instruction, fix and regenerate the response again."))
+                    state["messages"].append(HumanMessage(content=f"Each response must include {self._exec_open} to run code. Only mark the current step as [✓] after all code execution is complete. Please fix and regenerate."))
                     state["next_step"] = "generate"
             return state
 
         # Execute 함수는 수정하신 그대로 사용
         def execute(state: AgentState, config: RunnableConfig) -> AgentState:
             last_message = state["messages"][-1].content
-            if "<execute>" in last_message and "</execute>" not in last_message:
-                last_message += "</execute>"
+            if self._exec_open in last_message and self._exec_close not in last_message:
+                last_message += self._exec_close
 
-            execute_match = re.search(r"<execute>(.*?)</execute>", last_message, re.DOTALL)
+            execute_match = re.search(re.escape(self._exec_open) + r'(.*?)' + re.escape(self._exec_close), last_message, re.DOTALL)
             if execute_match:
                 code = execute_match.group(1)
                 timeout = self.timeout_seconds
                 result = self._traced_run_code(code, timeout)
-
-                if "Error:" in result or "Exception:" in result or "Traceback (most recent call last):" in result:
-                    print(f"🚨 코드 실행 에러 발생. GPT-4o로 자동 수정을 시도합니다...")
-                    try:
-                        fallback_llm = get_llm(model="gpt-4o", source="OpenAI")
-                        fix_prompt = f"The following Python code resulted in an error:\n```python\n{code}\n```\nError: {result}\nFix the error and output ONLY the python code in <execute> tags."
-                        fix_response = fallback_llm.invoke([HumanMessage(content=fix_prompt)])
-                        fixed_code_match = re.search(r"<execute>(.*?)</execute>", fix_response.content, re.DOTALL)
-                        if fixed_code_match:
-                            fixed_code = fixed_code_match.group(1).strip()
-                            result = self._traced_run_code(fixed_code, timeout)
-                            result = f"[GPT-4o Auto-fixed Code Executed]\n" + result
-                    except Exception as e:
-                        print(f"GPT-4o 디버깅 Fallback 실패: {e}")
 
                 if len(result) > 10000:
                     result = "The output is too long... Here are the first 10K characters...\n" + result[:10000]
@@ -1563,7 +1609,8 @@ For example: from [module_name] import [function_name]"""
                     "timestamp": datetime.now().isoformat()
                 })
 
-                state["messages"].append(AIMessage(content=f"\n<observation>{result}</observation>".strip()))
+                # HumanMessage로 변경: vLLM chat template은 연속 AIMessage를 거부함
+                state["messages"].append(HumanMessage(content=f"\n{self._obs_open}{result}{self._obs_close}".strip()))
 
             return state
 
