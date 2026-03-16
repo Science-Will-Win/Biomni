@@ -1457,16 +1457,24 @@ For example: from [module_name] import [function_name]"""
         # [추가] 1. Plan 전용 노드
         # ==========================================
         def plan_node(state: AgentState, config: RunnableConfig) -> AgentState:
-            messages = [SystemMessage(content=self.plan_prompt)] + [state["messages"][0]]
+            # 기존에는 첫 번째 메시지([state["messages"][0]])만 사용했으나,
+            # 피드백을 반영하여 다시 Plan을 세우려면 대화 히스토리 전체가 필요합니다.
+            messages = [SystemMessage(content=self.plan_prompt)] + state["messages"]
             response = self.llm.invoke(messages, config=config)
             
-            # 자동 실행 트리거 메시지
+            # 자동 실행 트리거를 제거하고 Plan 응답만 추가한 뒤 종료(대기)합니다.
+            state["messages"].append(response)
+            state["next_step"] = "end"
+            return state
+        
+        def prepare_generate_node(state: AgentState, config: RunnableConfig) -> AgentState:
             from langchain_core.messages import HumanMessage
+            # 사용자가 승인했을 때, 에이전트가 코드를 작성하고 실행하도록 유도합니다.
             auto_proceed_msg = HumanMessage(
-                content=f"Plan established. Please proceed with the execution automatically based on the plan. Output {self._think_open} and {self._exec_open} blocks."
+                content="Plan approved. Please proceed with the execution automatically based on the plan. Output <think> and <execute> blocks."
             )
             
-            state["messages"].extend([response, auto_proceed_msg])
+            state["messages"].append(auto_proceed_msg)
             state["next_step"] = "generate"
             return state
 
@@ -1628,17 +1636,31 @@ For example: from [module_name] import [function_name]"""
         # [추가] 3. 시작 라우팅 함수
         # ==========================================
         def route_start(state: AgentState):
+            # 첫 번째 질문이면 Plan 작성으로 이동
             if len(state["messages"]) == 1:
                 return "plan"
-            return "generate"
+            
+            # 이후 턴인 경우, 사용자가 입력한 가장 최근 피드백 확인
+            last_msg = state["messages"][-1].content.lower()
+            
+            # 승인/동의를 나타내는 키워드 (사용 환경에 맞게 키워드를 추가/수정하세요)
+            approval_keywords = ["승인", "진행", "진행해", "좋아", "ok", "yes", "approve", "go ahead", "콜", "맞아"]
+            
+            if any(keyword in last_msg for keyword in approval_keywords):
+                # 승인 시 코드 생성 트리거를 위해 prepare_generate 노드로 이동
+                return "prepare_generate"
+            else:
+                # 거절 혹은 내용 변경 요청인 경우, 피드백을 반영해 Plan을 다시 작성
+                return "plan"
 
         # ==========================================
         # [수정] 4. LangGraph 워크플로우 조립
         # ==========================================
         workflow = StateGraph(AgentState)
 
-        # 노드 추가
+        # 노드 추가 (새로 만든 prepare_generate_node 등록)
         workflow.add_node("plan", plan_node)
+        workflow.add_node("prepare_generate", prepare_generate_node)
         workflow.add_node("generate", generate)
         workflow.add_node("execute", execute)
 
@@ -1653,8 +1675,12 @@ For example: from [module_name] import [function_name]"""
         
         # 시작 지점 분기 추가
         workflow.add_conditional_edges(START, route_start)
-        # Plan 후 Generate로 자동 연결
-        workflow.add_edge("plan", "generate")
+        
+        # [핵심 변경] Plan 이후 강제로 Generate로 가지 않고, 사용자 피드백을 받기 위해 END로 중단
+        workflow.add_edge("plan", END)
+        
+        # 사용자가 승인하여 이 노드에 오게 되면, 트리거 삽입 후 Generate로 자동 연결
+        workflow.add_edge("prepare_generate", "generate")
 
         self.app = workflow.compile()
         self.checkpointer = MemorySaver()
