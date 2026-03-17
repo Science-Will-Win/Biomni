@@ -71,4 +71,30 @@ description = [
             }
         ],
     },
+    {
+        "description": "Inspect a Biomni tool to get its full parameter info, module path, and import example. Use this BEFORE calling any tool to understand its required and optional parameters.",
+        "name": "inspect_tool",
+        "optional_parameters": [],
+        "required_parameters": [
+            {
+                "name": "tool_name",
+                "type": "str",
+                "description": "Name of the tool function to inspect (e.g., 'analyze_circular_dichroism_spectra')",
+                "default": None,
+            }
+        ],
+    },
+    {
+        "description": "Inspect a data lake file to get its schema (columns, dtypes, shape) and sample rows. Use this BEFORE working with any dataset to understand its structure.",
+        "name": "inspect_data",
+        "optional_parameters": [],
+        "required_parameters": [
+            {
+                "name": "filename",
+                "type": "str",
+                "description": "Name of the file in the data lake (e.g., 'DepMap_CRISPRGeneDependency.csv')",
+                "default": None,
+            }
+        ],
+    },
 ]
