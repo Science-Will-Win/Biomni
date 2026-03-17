@@ -37,7 +37,13 @@ data_lake_dict = {
     "genetic_interaction.parquet": "Genetic interactions between genes.",
     "go-plus.json": "Gene ontology data for functional gene annotations.",
     "gtex_tissue_gene_tpm.parquet": "Gene expression (TPM) across human tissues from GTEx.",
-    "gwas_catalog.pkl": "Genome-wide association studies (GWAS) results.",
+    "gwas_catalog.pkl": (
+        "GWAS Catalog (pandas DataFrame, ~200K rows). "
+        "Columns: DISEASE/TRAIT, SNPS, SNP_ID_CURRENT (numeric, NO 'rs' prefix — e.g., 5030062 not rs5030062), "
+        "P-VALUE (float), CHR_ID, MAPPED_GENE, OR or BETA. "
+        "Usage: filter DISEASE/TRAIT with str.contains(keyword, case=False). "
+        "For SNP lookup, strip 'rs' prefix and match against SNP_ID_CURRENT, or use SNPS column (has 'rs' prefix)."
+    ),
     "hp.obo": "Official HPO release in obographs format",
     "kg.csv": "Precision medicine knowledge graph with 17,080 diseases and 4+ million relationships across biological scales.",
     "marker_celltype.parquet": "Cell type marker genes for identification.",
