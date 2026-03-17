@@ -386,3 +386,153 @@ def download_synapse_data(
         "results": results,
         "errors": errors if errors else None,
     }
+
+
+# ═══════════════════════════════════════════
+# Helper functions for tool/data inspection
+# ═══════════════════════════════════════════
+
+def inspect_tool(tool_name: str) -> str:
+    """Inspect a Biomni tool to get its full parameter info and import path.
+
+    Parameters
+    ----------
+    tool_name : str
+        Name of the tool function to inspect (e.g., "analyze_circular_dichroism_spectra").
+
+    Returns
+    -------
+    str
+        Formatted string with module path, import example, required and optional parameters.
+    """
+    try:
+        from biomni.utils import read_module2api
+        module2api = read_module2api()
+    except Exception as e:
+        return f"Error loading tool registry: {e}"
+
+    for module_name, tools in module2api.items():
+        for tool in tools:
+            if tool.get("name") == tool_name:
+                lines = [f"Tool: {tool_name}", f"Module: {module_name}"]
+                lines.append(f"Import: from {module_name} import {tool_name}")
+                lines.append("")
+
+                desc = tool.get("description", "")
+                if desc:
+                    lines.append(f"Description: {desc}")
+                    lines.append("")
+
+                req = tool.get("required_parameters", [])
+                if req:
+                    lines.append("Required parameters:")
+                    for p in req:
+                        default = p.get("default")
+                        default_str = f" (default: {default})" if default is not None else ""
+                        lines.append(f"  - {p.get('name', '?')}: {p.get('type', 'Any')}{default_str}")
+                        if p.get("description"):
+                            lines.append(f"    {p['description']}")
+
+                opt = tool.get("optional_parameters", [])
+                if opt:
+                    lines.append("Optional parameters:")
+                    for p in opt:
+                        default = p.get("default", "None")
+                        lines.append(f"  - {p.get('name', '?')}: {p.get('type', 'Any')} (default: {default})")
+                        if p.get("description"):
+                            lines.append(f"    {p['description']}")
+
+                return "\n".join(lines)
+
+    return f"Tool '{tool_name}' not found in registry."
+
+
+def inspect_data(filename: str) -> str:
+    """Inspect a data lake file to get its schema, columns, dtypes, and sample rows.
+
+    Parameters
+    ----------
+    filename : str
+        Name of the file in the data lake (e.g., "DepMap_CRISPRGeneDependency.csv").
+
+    Returns
+    -------
+    str
+        Formatted string with file path, shape, columns, dtypes, and sample rows.
+    """
+    import os
+
+    # Resolve data lake path from environment
+    data_base = os.environ.get("BIOMNI_DATA_PATH", "/app/data")
+    data_lake_dir = os.path.join(data_base, "biomni_data", "data_lake")
+    filepath = os.path.join(data_lake_dir, filename)
+
+    if not os.path.exists(filepath):
+        # Try direct path in case filename includes subdirectory
+        if os.path.exists(os.path.join(data_lake_dir, filename)):
+            filepath = os.path.join(data_lake_dir, filename)
+        else:
+            available = []
+            try:
+                available = sorted(os.listdir(data_lake_dir))[:20]
+            except OSError:
+                pass
+            msg = f"File '{filename}' not found in data lake at {data_lake_dir}."
+            if available:
+                msg += f"\nAvailable files: {', '.join(available)}"
+            return msg
+
+    if os.path.isdir(filepath):
+        try:
+            items = sorted(os.listdir(filepath))
+            total = len(items)
+            shown = items[:20]
+            lines = [f"Directory: {filepath}", f"Total items: {total}"]
+            for item in shown:
+                lines.append(f"  - {item}")
+            if total > 20:
+                lines.append(f"  ... and {total - 20} more")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error reading directory: {e}"
+
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+
+    try:
+        import pandas as pd
+
+        if ext == "parquet":
+            df = pd.read_parquet(filepath)
+        elif ext == "tsv":
+            df = pd.read_csv(filepath, sep="\t", nrows=5)
+            df_full_shape = pd.read_csv(filepath, sep="\t", usecols=[0])
+            df_shape = (len(df_full_shape), len(df.columns))
+        elif ext in ("csv", "txt"):
+            df = pd.read_csv(filepath, nrows=5)
+            df_full_shape = pd.read_csv(filepath, usecols=[0])
+            df_shape = (len(df_full_shape), len(df.columns))
+        else:
+            return f"Unsupported file format: .{ext}. Supported: csv, tsv, parquet, txt"
+
+        if ext == "parquet":
+            df_shape = df.shape
+            sample = df.head(3)
+        else:
+            sample = df.head(3)
+
+        lines = [
+            f"File: {filepath}",
+            f"Shape: {df_shape[0]} rows x {df_shape[1]} columns",
+            "",
+            "Columns and dtypes:",
+        ]
+        for col in df.columns:
+            lines.append(f"  - {col}: {df[col].dtype}")
+
+        lines.append("")
+        lines.append("Sample rows (first 3):")
+        lines.append(sample.to_string(max_colwidth=50))
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error reading file: {e}"

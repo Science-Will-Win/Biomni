@@ -1521,6 +1521,12 @@ For example: from [module_name] import [function_name]"""
             else:
                 msg = str(content)
 
+            # ── Repair broken UTF-8 replacement characters ──
+            # vLLM streaming may split multi-byte UTF-8 chars (e.g. ✓ = E2 9C 93)
+            # across chunks, resulting in \ufffd replacement characters.
+            # Replace known patterns: [�] or [���] → [✓] (checklist mark)
+            msg = re.sub(r'\[(?:\ufffd|●|◆|◇|○|■|□)+\]', '[✓]', msg)
+
             # 무한 루프 감지 로직
             loop_pattern = r"(<think>.*?</think>[\s\S]*?){3,}"
             previous_was_loop_warning = any("System Alert: Infinite loop detected" in m.content for m in state["messages"][-2:])
@@ -1558,11 +1564,11 @@ For example: from [module_name] import [function_name]"""
             step_num = state.get("current_step_number")
             if step_num is not None:
                 # Primary: numbered format "3. [✓]"
-                pattern = rf'(?:^|\n)\s*{step_num}\.\s*\[(?:✓|x|X|✗|v|V)\]'
+                pattern = rf'(?:^|\n)\s*{step_num}\.\s*\[(?:✓|x|X|✗|v|V|\ufffd+)\]'
                 if re.search(pattern, msg):
                     checklist_done = True
                 # Fallback: unnumbered [✓] or [✗] (Unicode only to avoid false positives with [x] in code)
-                elif not execute_match and re.search(r'\[(?:✓|✗)\]', msg):
+                elif not execute_match and re.search(r'\[(?:✓|✗|\ufffd+)\]', msg):
                     checklist_done = True
 
             if answer_match: state["next_step"] = "end"
