@@ -26,6 +26,11 @@ from biomni.utils import (
     read_module2api,
 )
 
+import json
+import hashlib
+from opentelemetry import trace
+from langchain_core.messages import HumanMessage, ToolMessage
+from biomni.memory.graph_memory import GraphMemory
 
 # Define the AgentState TypedDict for our custom implementation
 class AgentState(TypedDict):
@@ -34,6 +39,7 @@ class AgentState(TypedDict):
     # add_messages is a reducer that combines message sequences
     messages: Annotated[Sequence[BaseMessage], add_messages]
 
+tracer = trace.get_tracer("biomni.agent.react")
 
 class react:
     def __init__(
@@ -86,6 +92,7 @@ class react:
         self.tools = self._add_timeout_to_tools(self.tools)
         self.prompt = ""
         self.system_prompt = ""
+        self.graph_memory = GraphMemory()
 
     def _add_timeout_to_tools(self, tools):
         """Apply timeout wrapper to all tool functions using multiprocessing."""
@@ -303,27 +310,35 @@ Here is the list of available libraries with their descriptions:
 
         # Define the node that executes tools
         def tool_node(state: AgentState):
-            """Node that executes tools based on the LLM's decisions."""
             outputs = []
+            task_desc = state["messages"][0].content if state["messages"] else "Task"
+            
             for tool_call in state["messages"][-1].tool_calls:
-                try:
-                    tool_result = tools_by_name[tool_call["name"]].invoke(tool_call["args"])
-                    outputs.append(
-                        ToolMessage(
-                            content=json.dumps(tool_result),
-                            name=tool_call["name"],
-                            tool_call_id=tool_call["id"],
-                        )
-                    )
-                except Exception as e:
-                    # Handle any errors that occur during tool execution
-                    outputs.append(
-                        ToolMessage(
-                            content=json.dumps({"error": str(e)}),
-                            name=tool_call["name"],
-                            tool_call_id=tool_call["id"],
-                        )
-                    )
+                with tracer.start_as_current_span("Action_Observation") as span:
+                    tool_name = tool_call["name"]
+                    args_str = json.dumps(tool_call["args"])
+                    span.set_attributes({"tool.id": tool_name, "tool.input_hash": hashlib.md5(args_str.encode()).hexdigest()})
+                    
+                    try:
+                        tool_result = tools_by_name[tool_name].invoke(tool_call["args"])
+                        span.set_attribute("tool.success", True)
+                        outputs.append(ToolMessage(content=json.dumps(tool_result), name=tool_name, tool_call_id=tool_call["id"]))
+                    except Exception as e:
+                        error_msg = str(e)
+                        span.set_attribute("tool.success", False)
+                        span.add_event("Error", {"message": error_msg})
+
+                        # [추가] Reflexion 자가 반성 로직
+                        ref_prompt = f"도구 '{tool_name}' 에러: {error_msg}. 원인을 분석하고 다음 시도 시 해결책을 간략히 제시하라."
+                        try:
+                            reflection = self.llm.invoke([HumanMessage(content=ref_prompt)]).content
+                            span.add_event("Self_Reflection", {"reflection": reflection})
+                            self.graph_memory.save_error_and_reflection(str(task_desc)[:300], tool_name, error_msg[:300], reflection)
+                            enriched_error = f"Error: {error_msg}\nSelf-Reflection: {reflection}"
+                        except:
+                            enriched_error = f"Error: {error_msg}"
+
+                        outputs.append(ToolMessage(content=json.dumps({"error": enriched_error}), name=tool_name, tool_call_id=tool_call["id"]))
             return {"messages": outputs}
 
         # Define the conditional edge that determines whether to continue or not
