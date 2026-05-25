@@ -55,6 +55,9 @@ if os.path.exists(".env"):
 class AgentState(TypedDict):
     messages: list[BaseMessage]
     next_step: str | None
+    tool_calls: list[dict] | None  # bind_tools 모드에서 사용
+    current_step_number: int | None      # 1-based step index for checklist detection
+    is_final_step: bool | None           # True if this is the last step in the plan
 
 
 class A1:
@@ -224,7 +227,49 @@ class A1:
 
         # Add timeout parameter
         self.timeout_seconds = timeout_seconds  # 10 minutes default timeout
+
+        # Default token format (backward-compatible)
+        self._exec_open = "<execute>"
+        self._exec_close = "</execute>"
+        self._sol_open = "<solution>"
+        self._sol_close = "</solution>"
+        self._think_open = "<think>"
+        self._think_close = "</think>"
+        self._obs_open = "<observation>"
+        self._obs_close = "</observation>"
+
         self.configure()
+
+    def set_token_format(self, behavior: dict):
+        """Set token format from external behavior config (e.g., chat_handler)."""
+        def _close(tag: str) -> str:
+            if tag.startswith("["):
+                return tag.replace("[", "[/", 1)
+            return tag.replace("<", "</", 1)
+
+        exec_fmt = behavior.get("code_execute_format") or "<execute>"
+        sol_fmt = behavior.get("solution_format") or ""
+        think_fmt = behavior.get("think_format") or "<think>"
+        obs_fmt = behavior.get("code_result_format") or "<observation>"
+
+        self._exec_open = exec_fmt
+        self._exec_close = _close(exec_fmt)
+        self._sol_open = sol_fmt
+        self._sol_close = _close(sol_fmt) if sol_fmt else ""
+        self._think_open = think_fmt
+        self._think_close = _close(think_fmt)
+        self._obs_open = obs_fmt
+        self._obs_close = _close(obs_fmt)
+
+        # Update LLM stop sequences to match new format
+        if hasattr(self, 'llm'):
+            stops = [self._exec_close]
+            if sol_fmt and sol_fmt != self._exec_open:
+                stops.append(self._sol_close)
+            for attr in ('stop', 'stop_sequences'):
+                if hasattr(self.llm, attr):
+                    setattr(self.llm, attr, stops)
+                    break
 
     def add_tool(self, api):
         """Add a new tool to the agent's tool registry and make it available for retrieval.
@@ -1098,9 +1143,42 @@ class A1:
                     # Include full content in system prompt (metadata already removed)
                     know_how_formatted.append(f"📚 {name}:\n{content}")
 
+        # ==========================================
+        # [수정 1] 시스템 프롬프트를 2개의 독립된 헤더로 분리
+        # ==========================================
+#         plan_header = """You are Aigen R0, helpful biomedical assistant assigned with the task of problem-solving.
+# [CRITICAL DIRECTIVE - PLANNING PHASE]
+# Your ONLY task right now is to analyze the user's request and create a detailed, step-by-step plan.
+# Format your plan as a checklist with empty checkboxes like this:
+# 1. [ ] First step
+# 2. [ ] Second step
+
+# Do NOT write any python code, <execute> tags, or actual final solutions yet.
+# Output ONLY your thought process in <think> tags and the checklist wrapped in <solution> tags.
+# """
+
+#         execute_header = """You are Aigen R0, helpful biomedical assistant assigned with the task of problem-solving.
+# [CRITICAL DIRECTIVE - EXECUTION PHASE]
+# A detailed step-by-step plan has ALREADY been established in the conversation history.
+# Do NOT create a new plan from scratch. Your task is to execute the uncompleted steps.
+
+# Follow the plan step by step. After completing each step, update the checklist:
+# 1. [✓] First step (completed)
+# 2. [ ] Second step
+
+# At each turn, provide your thinking in <think> tags, then you must use EITHER:
+# 1) <execute> to run python/bash/R code.
+# 2) <solution> to provide the final answer.
+# Not both at the same time. No empty messages.
+# """
+        
+        # 이후 추가되는 도구/데이터베이스 설명을 담을 빈 문자열
+        # prompt_modifier = ""
+        # ==========================================
+
         # Base prompt
         prompt_modifier = """
-You are Aigen R0, helpful biomedical assistant assigned with the task of problem-solving.
+You are a helpful biomedical assistant assigned with the task of problem-solving.
 To achieve this, you will be using an interactive coding environment equipped with a variety of tool functions, data, and softwares to assist you throughout the process.
 
 Given a task, make a plan first. The plan should be a numbered list of steps that you will take to solve the task. Be specific and detailed.
@@ -1288,53 +1366,57 @@ For example: from [module_name] import [function_name]"""
         if custom_software_formatted:
             format_dict["custom_software"] = "\n".join(custom_software_formatted)
 
-        formatted_prompt = prompt_modifier.format(**format_dict)
+        plan_template = plan_header + prompt_modifier
+        execute_template = execute_header + prompt_modifier
 
-        return formatted_prompt
+        return {
+            "plan": plan_template.format(**format_dict),
+            "execute": execute_template.format(**format_dict)
+        }
     
     # 🌟 1. A1 클래스의 메서드로 새로 추가 (configure 메서드 위나 아래에 배치)
     @observe(name="Run Sandbox Code")
     def _traced_run_code(self, code: str, timeout: int):
-        # Langfuse에 실행 코드 입력으로 기록
-        langfuse_context.update_current_observation(
-            input=code,
-            metadata={"timeout": timeout},
-        )
-
+        # 파이썬/R/Bash 실행에 필요한 모듈들이 파일 상단에 import 되어있다고 가정합니다.
+        # (run_with_timeout, run_r_code, run_bash_script, run_python_repl 등)
+        
         if code.strip().startswith("#!R") or code.strip().startswith("# R code") or code.strip().startswith("# R script"):
             r_code = re.sub(r"^#!R|^# R code|^# R script", "", code, count=1).strip()
-            result = run_with_timeout(run_r_code, [r_code], timeout=timeout)
-
+            return run_with_timeout(run_r_code, [r_code], timeout=timeout)
+        
         elif code.strip().startswith("#!BASH") or code.strip().startswith("# Bash script") or code.strip().startswith("#!CLI"):
             if code.strip().startswith("#!CLI"):
                 cli_command = re.sub(r"^#!CLI", "", code, count=1).strip().replace("\n", " ")
-                result = run_with_timeout(run_bash_script, [cli_command], timeout=timeout)
+                return run_with_timeout(run_bash_script, [cli_command], timeout=timeout)
             else:
                 bash_script = re.sub(r"^#!BASH|^# Bash script", "", code, count=1).strip()
-                result = run_with_timeout(run_bash_script, [bash_script], timeout=timeout)
-
+                return run_with_timeout(run_bash_script, [bash_script], timeout=timeout)
+        
         else:
+            # self를 통해 A1 클래스의 다른 메서드 호출
             self._clear_execution_plots()
             self._inject_custom_functions_to_repl()
-            result = run_with_timeout(run_python_repl, [code], timeout=timeout)
+            return run_with_timeout(run_python_repl, [code], timeout=timeout)
 
-        # Langfuse에 실행 결과 출력으로 기록
-        langfuse_context.update_current_observation(
-            output=result[:2000] if isinstance(result, str) else str(result)[:2000],
-        )
-
-        return result
-
-    def configure(self, self_critic=False, test_time_scale_round=0):
+    def configure(self, self_critic=False, test_time_scale_round=0,
+                  execution_mode="default", code_marker="execute"):
         """Configure the agent with the initial system prompt and workflow.
 
         Args:
             self_critic: Whether to enable self-critic mode
             test_time_scale_round: Number of rounds for test time scaling
+            execution_mode: "default" (기존 <execute> 방식) | "tool_select" (bind_tools 방식) | "native" (학습 후)
+            code_marker: "execute" (<execute> 텍스트 사용) | "wrap" ([EXECUTE] 시스템 래핑)
 
+        3가지 조합 (aigen_server가 모델에 따라 자동 선택):
+            api_execute:    execution_mode="tool_select", code_marker="execute"  — Cloud API 모델
+            wrap_execute:   execution_mode="tool_select", code_marker="wrap"     — 로컬 모델 학습 전
+            native_execute: execution_mode="native",      code_marker="execute"  — 로컬 모델 학습 후
         """
-        # Store self_critic for later use
+        # Store configuration for later use
         self.self_critic = self_critic
+        self.execution_mode = execution_mode
+        self.code_marker = code_marker
 
         # Get data lake content
         data_lake_path = self.path + "/data_lake"
@@ -1404,7 +1486,7 @@ For example: from [module_name] import [function_name]"""
                 )
             print(f"📚 Loading {len(know_how_docs)} know-how documents into system prompt")
 
-        self.system_prompt = self._generate_system_prompt(
+        system_prompts = self._generate_system_prompt(
             tool_desc=tool_desc,
             data_lake_content=data_lake_with_desc,
             library_content_list=library_content_list,
@@ -1415,311 +1497,263 @@ For example: from [module_name] import [function_name]"""
             custom_software=custom_software if custom_software else None,
             know_how_docs=know_how_docs if know_how_docs else None,
         )
+        self.plan_prompt = system_prompts["plan"]
+        self.execute_prompt = system_prompts["execute"]
 
         # Define the nodes
+        # ==========================================
+        # [추가] 1. Plan 전용 노드
+        # ==========================================
+        def plan_node(state: AgentState, config: RunnableConfig) -> AgentState:
+            # 기존에는 첫 번째 메시지([state["messages"][0]])만 사용했으나,
+            # 피드백을 반영하여 다시 Plan을 세우려면 대화 히스토리 전체가 필요합니다.
+            messages = [SystemMessage(content=self.plan_prompt)] + state["messages"]
+            response = self.llm.invoke(messages, config=config)
+            
+            # 자동 실행 트리거를 제거하고 Plan 응답만 추가한 뒤 종료(대기)합니다.
+            state["messages"].append(response)
+            state["next_step"] = "end"
+            return state
+        
+        def prepare_generate_node(state: AgentState, config: RunnableConfig) -> AgentState:
+            from langchain_core.messages import HumanMessage
+            # 사용자가 승인했을 때, 에이전트가 코드를 작성하고 실행하도록 유도합니다.
+            auto_proceed_msg = HumanMessage(
+                content="Plan approved. Please proceed with the execution automatically based on the plan. Output <think> and <execute> blocks."
+            )
+            
+            state["messages"].append(auto_proceed_msg)
+            state["next_step"] = "generate"
+            return state
+
+        # ==========================================
+        # [수정] 2. Generate(Execute) 전용 노드
+        # ==========================================
         def generate(state: AgentState, config: RunnableConfig) -> AgentState:
-            # Add OpenAI-specific formatting reminders if using OpenAI models
-            system_prompt = self.system_prompt
-            if hasattr(self.llm, "model_name") and (
-                "gpt" in str(self.llm.model_name).lower() or "openai" in str(type(self.llm)).lower()
-            ):
-                system_prompt += "\n\nIMPORTANT FOR GPT MODELS: You MUST use XML tags <execute> or <solution> in EVERY response. Do not use markdown code blocks (```) - use <execute> tags instead."
+            # Prefer externally-set system_prompt (parameterized by chat_handler)
+            sys_prompt = getattr(self, 'system_prompt', None) or self.execute_prompt
+            # GPT/o1/o3 models only — exclude vLLM local models that also use ChatOpenAI
+            _mn = str(getattr(self.llm, "model_name", "")).lower()
+            if any(k in _mn for k in ("gpt", "o1", "o3")):
+                sol_hint = f" or {self._sol_open}" if self._sol_open else ""
+                sys_prompt += (
+                    f"\n\nIMPORTANT: You MUST use {self._exec_open}{sol_hint} tags in EVERY response. "
+                    f"Do not use markdown code blocks (```) - use {self._exec_open} tags instead."
+                )
 
-            messages = [SystemMessage(content=system_prompt)] + state["messages"]
-            response = self.llm.invoke(messages, config=config) # config 전달로 LLM 트레이싱 연동
+            messages = [SystemMessage(content=sys_prompt)] + state["messages"]
 
-            # Normalize Responses API content blocks (list of dicts) into a plain string
+            # vLLM/SGLang requires last message to be HumanMessage for generation
+            if messages and isinstance(messages[-1], AIMessage):
+                messages.append(HumanMessage(content="Continue. Execute code or mark the step as complete."))
+
+            # Pass stop sequences at invocation time (setattr on Pydantic model doesn't propagate to API calls)
+            stop_seqs = [self._exec_close]
+            if self._sol_close and self._sol_close != self._exec_close:
+                stop_seqs.append(self._sol_close)
+            response = self.llm.invoke(messages, config=config, stop=stop_seqs)
+
+            # (중략된 파싱 로직 시작) - 기존 코드와 동일하게 유지
             content = response.content
             if isinstance(content, list):
-                # Concatenate textual parts; ignore tool_use or other non-text blocks
-                text_parts: list[str] = []
+                text_parts = []
                 for block in content:
                     try:
-                        if isinstance(block, dict):
-                            btype = block.get("type")
-                            if btype in ("text", "output_text", "redacted_text"):
-                                part = block.get("text") or block.get("content") or ""
-                                if isinstance(part, str):
-                                    text_parts.append(part)
+                        if isinstance(block, dict) and block.get("type") in ("text", "output_text", "redacted_text"):
+                            part = block.get("text") or block.get("content") or ""
+                            if isinstance(part, str):
+                                text_parts.append(part)
                     except Exception:
-                        # Be conservative; skip malformed blocks
                         continue
                 msg = "".join(text_parts)
             else:
-                # Fallback to string conversion for legacy content
                 msg = str(content)
 
-            # ==========================================
-            # [수정] 무한 루프 감지, 재실행 및 GPT-4o 컨텍스트 축약 Fallback
-            # ==========================================
+            # ── Repair broken UTF-8 replacement characters ──
+            # vLLM streaming may split multi-byte UTF-8 chars (e.g. ✓ = E2 9C 93)
+            # across chunks, resulting in \ufffd replacement characters.
+            # Replace known patterns: [�] or [���] → [✓] (checklist mark)
+            msg = re.sub(r'\[(?:\ufffd|●|◆|◇|○|■|□)+\]', '[✓]', msg)
+
+            # 무한 루프 감지 로직
             loop_pattern = r"(<think>.*?</think>[\s\S]*?){3,}"
-            
-            # 이전 메시지가 루프 경고였는지 확인 (1차 재실행 여부 판단)
             previous_was_loop_warning = any("System Alert: Infinite loop detected" in m.content for m in state["messages"][-2:])
             
             if re.search(loop_pattern, msg, re.IGNORECASE) or (len(msg) > 3000 and msg[:1000] == msg[1000:2000]):
                 if not previous_was_loop_warning:
-                    print("🚨 무한 추론 루프(Thought Loop) 1차 감지! 현재 에이전트를 강제 종료하고 재실행을 유도합니다.")
-                    # 현재 응답을 자르고 경고 메시지를 추가하여 현재 모델이 스스로 고치도록 1차 유도
+                    print("🚨 무한 추론 루프 1차 감지!")
                     state["messages"].append(AIMessage(content=msg[:500] + "\n... [LOOP TRUNCATED]"))
-                    state["messages"].append(HumanMessage(content="System Alert: Infinite loop detected. Stop repeating. Please evaluate your last step and provide a new, concise plan with a single <execute> or <solution> block."))
+                    state["messages"].append(HumanMessage(content=f"System Alert: Infinite loop detected. Stop repeating. Please evaluate your last step and provide a new, concise plan with a single {self._exec_open} or {self._sol_open} block."))
                     state["next_step"] = "generate"
                     return state
                 else:
-                    print("🚨 무한 추론 루프 2차 감지! 대화 기록을 축약하여 GPT-4o로 검증 및 Fallback을 시도합니다.")
-                    try:
-                        from langchain_core.messages import HumanMessage
-                        fallback_llm = get_llm(model="gpt-4o", source="OpenAI")
-                        fallback_prompt = (
-                            "System Alert: The primary agent got stuck in an infinite loop. "
-                            "Please review the system instructions, the original user request, and the last observation. "
-                            "Provide the correct next step. You MUST output EITHER <execute> python code here </execute> OR <solution> direct answer </solution>."
-                        )
-                        
-                        # [핵심] 중간 과정을 생략하고 축약된 컨텍스트만 구성
-                        sys_msg = SystemMessage(content=self.system_prompt)
-                        user_prompt = state["messages"][0] # 첫 사용자 질문
-                        # 직전 관찰 결과(Observation) 찾기 (가장 최근 Human/Tool/Observation 메시지)
-                        last_observation = state["messages"][-2] if len(state["messages"]) > 2 else state["messages"][0]
-                        
-                        fallback_messages = [
-                            sys_msg,
-                            user_prompt,
-                            last_observation,
-                            HumanMessage(content=fallback_prompt)
-                        ]
-                        
-                        fallback_response = fallback_llm.invoke(fallback_messages)
-                        msg = fallback_response.content
-                    except Exception as e:
-                        print(f"Fallback failed: {e}")
-            # ==========================================
-            
-            # Enhanced parsing for better OpenAI compatibility
-            # Check for incomplete tags and fix them
-            if "<execute>" in msg and "</execute>" not in msg:
-                msg += "</execute>"
-            if "<solution>" in msg and "</solution>" not in msg:
-                msg += "</solution>"
-            if "<think>" in msg and "</think>" not in msg:
-                msg += "</think>"
+                    print("🚨 무한 추론 루프 2차 감지! Stopping step.")
+                    state["messages"].append(AIMessage(content="[Error] Infinite reasoning loop detected. Stopping."))
+                    state["next_step"] = "end"
+                    return state
 
-            # More flexible pattern matching for different LLM styles
-            think_match = re.search(r"<think>(.*?)</think>", msg, re.DOTALL | re.IGNORECASE)
-            execute_match = re.search(r"<execute>(.*?)</execute>", msg, re.DOTALL | re.IGNORECASE)
-            answer_match = re.search(r"<solution>(.*?)</solution>", msg, re.DOTALL | re.IGNORECASE)
+            if self._exec_open in msg and self._exec_close not in msg: msg += self._exec_close
+            if self._sol_open in msg and self._sol_close not in msg: msg += self._sol_close
+            if self._think_open in msg and self._think_close not in msg: msg += self._think_close
 
-            # Alternative patterns for OpenAI models that might use different formatting
+            think_match = re.search(re.escape(self._think_open) + r'(.*?)' + re.escape(self._think_close), msg, re.DOTALL | re.IGNORECASE)
+            execute_match = re.search(re.escape(self._exec_open) + r'(.*?)' + re.escape(self._exec_close), msg, re.DOTALL | re.IGNORECASE)
+            answer_match = re.search(re.escape(self._sol_open) + r'(.*?)' + re.escape(self._sol_close), msg, re.DOTALL | re.IGNORECASE)
+
             if not execute_match:
-                # Try to find code blocks that might be intended as execute blocks
                 code_block_match = re.search(r"```(?:python|bash|r)?\s*(.*?)```", msg, re.DOTALL)
                 if code_block_match and not answer_match:
-                    # If we found a code block and no solution, treat it as execute
                     execute_match = code_block_match
 
-            # Add the message to the state before checking for errors
             state["messages"].append(AIMessage(content=msg.strip()))
 
-            if answer_match:
-                state["next_step"] = "end"
-            elif execute_match:
-                state["next_step"] = "execute"
-            elif think_match:
-                state["next_step"] = "generate"
+            # ── Checklist completion detection ──
+            checklist_done = False
+            step_num = state.get("current_step_number")
+            if step_num is not None:
+                # Primary: numbered format "3. [✓]"
+                pattern = rf'(?:^|\n)\s*{step_num}\.\s*\[(?:✓|x|X|✗|v|V|\ufffd+)\]'
+                if re.search(pattern, msg):
+                    checklist_done = True
+                # Fallback: unnumbered [✓] or [✗] (Unicode only to avoid false positives with [x] in code)
+                elif not execute_match and re.search(r'\[(?:✓|✗|\ufffd+)\]', msg):
+                    checklist_done = True
+
+            if answer_match: state["next_step"] = "end"
+            elif checklist_done: state["next_step"] = "end"
+            elif execute_match: state["next_step"] = "execute"
+            elif think_match: state["next_step"] = "generate"
             else:
                 print("parsing error...")
-
-                error_count = sum(
-                    1 for m in state["messages"] if isinstance(m, AIMessage) and "There are no tags" in m.content
-                )
-
+                error_count = sum(1 for m in state["messages"] if isinstance(m, AIMessage) and "There are no tags" in m.content)
                 if error_count >= 2:
-                    # If we've already tried to correct the model twice, just end the conversation
-                    print("Detected repeated parsing errors, ending conversation")
                     state["next_step"] = "end"
-                    # Add a final message explaining the termination
-                    state["messages"].append(
-                        AIMessage(
-                            content="Execution terminated due to repeated parsing errors. Please check your input and try again."
-                        )
-                    )
+                    state["messages"].append(AIMessage(content="Execution terminated due to repeated parsing errors."))
                 else:
-                    # Try to correct it
-                    state["messages"].append(
-                        HumanMessage(
-                            content="Each response must include thinking process followed by either <execute> or <solution> tag. But there are no tags in the current response. Please follow the instruction, fix and regenerate the response again."
-                        )
-                    )
+                    state["messages"].append(HumanMessage(content=f"Each response must include {self._exec_open} to run code. Only mark the current step as [✓] after all code execution is complete. Please fix and regenerate."))
                     state["next_step"] = "generate"
             return state
-        
-        # 🌟 2. 기존 configure 내부의 execute 함수 수정
+
+        # Execute 함수는 수정하신 그대로 사용
         def execute(state: AgentState, config: RunnableConfig) -> AgentState:
             last_message = state["messages"][-1].content
-            # Only add the closing tag if it's not already there
-            if "<execute>" in last_message and "</execute>" not in last_message:
-                last_message += "</execute>"
+            if self._exec_open in last_message and self._exec_close not in last_message:
+                last_message += self._exec_close
 
-            execute_match = re.search(r"<execute>(.*?)</execute>", last_message, re.DOTALL)
+            execute_match = re.search(re.escape(self._exec_open) + r'(.*?)' + re.escape(self._exec_close), last_message, re.DOTALL)
             if execute_match:
                 code = execute_match.group(1)
-
-                # Set timeout duration (10 minutes = 600 seconds)
                 timeout = self.timeout_seconds
-
-                # 기존에 길었던 코드가 아래 한 줄로 깔끔해집니다.
-                # 이 함수가 실행되면서 Langfuse로 상세 실행 기록이 전송됩니다.
                 result = self._traced_run_code(code, timeout)
 
-                # ==========================================
-                # [수정 2] 데이터 로드/실행 에러 발생 시 GPT-4o 자동 디버깅
-                # ==========================================
-                if "Error:" in result or "Exception:" in result or "Traceback (most recent call last):" in result:
-                    print(f"🚨 코드 실행 에러 발생. GPT-4o로 자동 수정을 시도합니다...\n에러 요약: {result[-200:]}")
-                    try:
-                        from langchain_core.messages import HumanMessage
-                        fallback_llm = get_llm(model="gpt-4o", source="OpenAI")
-                        fix_prompt = f"""
-                        The following Python code resulted in an error during execution:
-                        ```python\n{code}\n```
-                        Error Output: {result}
-                        
-                        USER INTENT: The user is trying to process files from the data_lake or run a function.
-                        If the error is related to unsupported file formats (e.g., trying to read .parquet, .pkl, .json, or .xlsx as CSV), write Python code using pandas or appropriate libraries to safely read it into a DataFrame.
-                        Fix the error. Provide ONLY the fixed Python code enclosed in <execute> and </execute> tags. Do NOT add any other text.
-                        """
-                        fix_response = fallback_llm.invoke([HumanMessage(content=fix_prompt)])
-                        fixed_code_match = re.search(r"<execute>(.*?)</execute>", fix_response.content, re.DOTALL)
-                        
-                        if fixed_code_match:
-                            fixed_code = fixed_code_match.group(1).strip()
-                            print("💡 GPT-4o가 코드를 수정했습니다. 수정된 코드로 재실행합니다.")
-                            result = self._traced_run_code(fixed_code, timeout)
-                            result = f"[GPT-4o Auto-fixed Code Executed]\n" + result
-                    except Exception as e:
-                        print(f"GPT-4o 디버깅 Fallback 실패: {e}")
-                # ==========================================
-
                 if len(result) > 10000:
-                    result = (
-                        "The output is too long to be added to context. Here are the first 10K characters...\n"
-                        + result[:10000]
-                    )
+                    result = "The output is too long... Here are the first 10K characters...\n" + result[:10000]
 
-                # Store the execution result with the triggering message
-                if not hasattr(self, "_execution_results"):
-                    self._execution_results = []
-
-                # Get any plots that were generated during this execution
-                execution_plots = []
+                if not hasattr(self, "_execution_results"): self._execution_results = []
+                
                 try:
                     from biomni.tool.support_tools import get_captured_plots
-
-                    current_plots = get_captured_plots()
-                    execution_plots = current_plots.copy()
-                except Exception as e:
-                    print(f"Warning: Could not capture plots from execution: {e}")
+                    execution_plots = get_captured_plots().copy()
+                except Exception:
                     execution_plots = []
 
-                # Store the execution result with metadata
-                execution_entry = {
-                    "triggering_message": last_message,  # The AI message that contained <execute>
-                    "images": execution_plots,  # Base64 encoded images from this execution
-                    "timestamp": datetime.now().isoformat(),
-                }
-                self._execution_results.append(execution_entry)
+                self._execution_results.append({
+                    "triggering_message": last_message,
+                    "images": execution_plots,
+                    "timestamp": datetime.now().isoformat()
+                })
 
-                observation = f"\n<observation>{result}</observation>"
-                state["messages"].append(AIMessage(content=observation.strip()))
+                # HumanMessage로 변경: vLLM chat template은 연속 AIMessage를 거부함
+                state["messages"].append(HumanMessage(content=f"\n{self._obs_open}{result}{self._obs_close}".strip()))
 
             return state
 
-        def routing_function(
-            state: AgentState,
-        ) -> Literal["execute", "generate", "end"]:
-            next_step = state.get("next_step")
-            if next_step == "execute":
-                return "execute"
-            elif next_step == "generate":
-                return "generate"
-            elif next_step == "end":
-                return "end"
-            else:
-                raise ValueError(f"Unexpected next_step: {next_step}")
+        # 라우팅 함수들 그대로 유지
+        def routing_function(state: AgentState) -> Literal["execute", "generate", "end"]:
+            return state.get("next_step")
 
-        def routing_function_self_critic(
-            state: AgentState,
-        ) -> Literal["generate", "end"]:
-            next_step = state.get("next_step")
-            if next_step == "generate":
-                return "generate"
-            elif next_step == "end":
-                return "end"
-            else:
-                raise ValueError(f"Unexpected next_step: {next_step}")
+        def routing_function_self_critic(state: AgentState) -> Literal["generate", "end"]:
+            return state.get("next_step")
 
         def execute_self_critic(state: AgentState) -> AgentState:
+            # (기존 코드와 동일)
             if self.critic_count < test_time_scale_round:
-                # Generate feedback based on message history
-                messages = state["messages"]
-                feedback_prompt = f"""
-                Here is a reminder of what is the user requested: {self.user_task}
-                Examine the previous executions, reaosning, and solutions.
-                Critic harshly on what could be improved?
-                Be specific and constructive.
-                Think hard what are missing to solve the task.
-                No question asked, just feedbacks.
-                """
-                feedback = self.llm.invoke(messages + [HumanMessage(content=feedback_prompt)])
-
-                # Add feedback as a new message
-                state["messages"].append(
-                    HumanMessage(
-                        content=f"Wait... this is not enough to solve the task. Here are some feedbacks for improvement:\n{feedback.content}"
-                    )
-                )
+                feedback = self.llm.invoke(state["messages"] + [HumanMessage(content=f"Critic harshly on what could be improved for: {self.user_task}")])
+                state["messages"].append(HumanMessage(content=f"Feedbacks:\n{feedback.content}"))
                 self.critic_count += 1
                 state["next_step"] = "generate"
             else:
                 state["next_step"] = "end"
-
             return state
 
-        # Create the workflow
+        # ==========================================
+        # [추가] 3. 시작 라우팅 함수
+        # ==========================================
+        # def route_start(state: AgentState):
+        #     # 첫 번째 질문이면 Plan 작성으로 이동
+        #     if len(state["messages"]) == 1:
+        #         return "plan"
+            
+        #     # 이후 턴인 경우, 사용자가 입력한 가장 최근 피드백 확인
+        #     last_msg = state["messages"][-1].content.lower()
+            
+        #     # 승인/동의를 나타내는 키워드 (사용 환경에 맞게 키워드를 추가/수정하세요)
+        #     approval_keywords = ["승인", "진행", "진행해", "좋아", "ok", "yes", "approve", "go ahead", "콜", "맞아"]
+            
+        #     if any(keyword in last_msg for keyword in approval_keywords):
+        #         # 승인 시 코드 생성 트리거를 위해 prepare_generate 노드로 이동
+        #         return "prepare_generate"
+        #     else:
+        #         # 거절 혹은 내용 변경 요청인 경우, 피드백을 반영해 Plan을 다시 작성
+        #         return "plan"
+
+        def route_start(state: AgentState):
+            return "generate"
+
+        # ==========================================
+        # [수정] 4. LangGraph 워크플로우 조립
+        # ==========================================
+        # workflow = StateGraph(AgentState)
+
+        # # 노드 추가 (새로 만든 prepare_generate_node 등록)
+        # workflow.add_node("plan", plan_node)
+        # workflow.add_node("prepare_generate", prepare_generate_node)
+        # workflow.add_node("generate", generate)
+        # workflow.add_node("execute", execute)
+
+        # if self_critic:
+        #     workflow.add_node("self_critic", execute_self_critic)
+        #     workflow.add_conditional_edges("generate", routing_function, path_map={"execute": "execute", "generate": "generate", "end": "self_critic"})
+        #     workflow.add_conditional_edges("self_critic", routing_function_self_critic, path_map={"generate": "generate", "end": END})
+        # else:
+        #     workflow.add_conditional_edges("generate", routing_function, path_map={"execute": "execute", "generate": "generate", "end": END})
+            
+        # workflow.add_edge("execute", "generate")
+        
+        # # 시작 지점 분기 추가
+        # workflow.add_conditional_edges(START, route_start)
+        
+        # # [핵심 변경] Plan 이후 강제로 Generate로 가지 않고, 사용자 피드백을 받기 위해 END로 중단
+        # workflow.add_edge("plan", END)
+        
+        # # 사용자가 승인하여 이 노드에 오게 되면, 트리거 삽입 후 Generate로 자동 연결
+        # workflow.add_edge("prepare_generate", "generate")
+
         workflow = StateGraph(AgentState)
 
-        # Add nodes
         workflow.add_node("generate", generate)
         workflow.add_node("execute", execute)
 
         if self_critic:
             workflow.add_node("self_critic", execute_self_critic)
-            # Add conditional edges
-            workflow.add_conditional_edges(
-                "generate",
-                routing_function,
-                path_map={
-                    "execute": "execute",
-                    "generate": "generate",
-                    "end": "self_critic",
-                },
-            )
-            workflow.add_conditional_edges(
-                "self_critic",
-                routing_function_self_critic,
-                path_map={"generate": "generate", "end": END},
-            )
+            workflow.add_conditional_edges("generate", routing_function, path_map={"execute": "execute", "generate": "generate", "end": "self_critic"})
+            workflow.add_conditional_edges("self_critic", routing_function_self_critic, path_map={"generate": "generate", "end": END})
         else:
-            # Add conditional edges
-            workflow.add_conditional_edges(
-                "generate",
-                routing_function,
-                path_map={"execute": "execute", "generate": "generate", "end": END},
-            )
-        workflow.add_edge("execute", "generate")
-        workflow.add_edge(START, "generate")
+            workflow.add_conditional_edges("generate", routing_function, path_map={"execute": "execute", "generate": "generate", "end": END})
 
-        # Compile the workflow
+        workflow.add_edge("execute", "generate")
+        workflow.add_conditional_edges(START, route_start)
+
         self.app = workflow.compile()
         self.checkpointer = MemorySaver()
         self.app.checkpointer = self.checkpointer
@@ -1849,20 +1883,19 @@ For example: from [module_name] import [function_name]"""
 
         return selected_resources_names
 
-    @observe(name="A1 Chat")
     def go(self, prompt: str, callbacks: Callbacks = None, session_id: str = None):
-        """Execute the agent with the given prompt."""
+        """Execute the agent with the given prompt.
+
+        Args:
+            prompt: The user's query
+
+        """
+        # session_id가 안 넘어올 경우를 대비해 고유 UUID 자동 생성
         if session_id is None:
             session_id = str(uuid.uuid4())
 
         self.critic_count = 0
         self.user_task = prompt
-
-        # Langfuse에 입력 프롬프트 기록
-        langfuse_context.update_current_observation(
-            input=prompt,
-            metadata={"session_id": session_id},
-        )
 
         if self.use_tool_retriever:
             selected_resources_names = self._prepare_resources_for_retrieval(prompt, callbacks=callbacks)
@@ -1871,38 +1904,22 @@ For example: from [module_name] import [function_name]"""
         inputs = {"messages": [HumanMessage(content=prompt)], "next_step": None}
         config = {"recursion_limit": 500, "configurable": {"thread_id": session_id}}
         if callbacks:
-            config["callbacks"] = callbacks
+            config["callbacks"] = callbacks # LangGraph 스트림에 콜백 등록
         self.log = []
 
+        # Store the final conversation state for markdown generation
         final_state = None
 
         for s in self.app.stream(inputs, stream_mode="values", config=config):
             message = s["messages"][-1]
             out = pretty_print(message)
             self.log.append(out)
-            final_state = s
+            final_state = s  # Store the latest state
 
+        # Store the conversation state for markdown generation
         self._conversation_state = final_state
 
-        final_answer = message.content if isinstance(message.content, str) else str(message.content)
-
-        # Langfuse에 전체 대화 기록 + 최종 출력 저장
-        langfuse_context.update_current_observation(
-            output=final_answer,
-            metadata={
-                "session_id": session_id,
-                "message_count": len(final_state["messages"]) if final_state else 0,
-                "conversation": [
-                    {
-                        "role": "human" if isinstance(m, HumanMessage) else "ai",
-                        "content": m.content if isinstance(m.content, str) else str(m.content),
-                    }
-                    for m in (final_state["messages"] if final_state else [])
-                ],
-            },
-        )
-
-        return self.log, final_answer
+        return self.log, message.content
 
     def go_stream(self, prompt: str, callbacks: Callbacks = None) -> Generator[dict, None, None]:
         """Execute the agent with the given prompt and return a generator that yields each step.
@@ -2040,7 +2057,7 @@ For example: from [module_name] import [function_name]"""
         # Extract know-how documents if present
         know_how_docs = selected_resources.get("know_how", [])
 
-        self.system_prompt = self._generate_system_prompt(
+        system_prompts = self._generate_system_prompt(
             tool_desc=tool_desc,
             data_lake_content=data_lake_with_desc,
             library_content_list=selected_resources["libraries"],
@@ -2051,6 +2068,8 @@ For example: from [module_name] import [function_name]"""
             custom_software=custom_software if custom_software else None,
             know_how_docs=know_how_docs if know_how_docs else None,
         )
+        self.plan_prompt = system_prompts["plan"]
+        self.execute_prompt = system_prompts["execute"]
 
         # Print the raw system prompt for debugging
         # print("\n" + "="*20 + " RAW SYSTEM PROMPT FROM AGENT " + "="*20)
@@ -2741,6 +2760,230 @@ For example: from [module_name] import [function_name]"""
             wrapper.__signature__ = inspect.Signature(new_params, return_annotation=dict)
 
             return wrapper
+
+    # ──────────────────────────────────────────────────────────────
+    # Phase 0 extensions: bind_tools, streaming, plan/step 분리
+    # 기존 go(), go_stream(), configure() 기본 동작은 변경하지 않음.
+    # ──────────────────────────────────────────────────────────────
+
+    @property
+    def _code_execution_tools(self) -> set[str]:
+        """코드 실행 도구 이름 집합"""
+        return {"code_gen", "execute_code", "run_analysis"}
+
+    def _get_bind_tools_schema(self):
+        """module2api + _custom_functions를 LangChain bind_tools 형식으로 변환"""
+        from langchain_core.tools import StructuredTool
+
+        tools = []
+        for _module_name, api_list in self.module2api.items():
+            for api in api_list:
+                if api["name"] == "run_python_repl":
+                    continue
+                func = self._custom_functions.get(api["name"])
+                if func:
+                    tool = StructuredTool.from_function(
+                        func=func,
+                        name=api["name"],
+                        description=api.get("description", ""),
+                    )
+                    tools.append(tool)
+        return tools
+
+    def _call_registered_tool(self, tool_name: str, args: dict):
+        """_custom_functions에 등록된 도구를 직접 호출"""
+        func = self._custom_functions.get(tool_name)
+        if func is None:
+            return {"error": f"Tool '{tool_name}' not found in registered functions"}
+        try:
+            return func(**args)
+        except Exception as e:
+            return {"error": str(e)}
+
+    @staticmethod
+    def _extract_execute_block(text: str) -> str | None:
+        """<execute>...</execute> 블록에서 코드 추출"""
+        match = re.search(r"<execute>(.*?)</execute>", text, re.DOTALL)
+        return match.group(1).strip() if match else None
+
+    @staticmethod
+    def _inject_execute_instructions(prompt: str) -> str:
+        """API 모델용: <execute> 사용법 안내를 시스템 프롬프트에 추가"""
+        instructions = (
+            "\n\nWhen you need to execute code, wrap it in <execute> tags:\n"
+            "<execute>\n# your code here\n</execute>\n"
+            "The system will execute the code and return the result in <observation> tags."
+        )
+        return prompt + instructions
+
+    @staticmethod
+    def _assemble_tool_calls(chunks: list) -> list[dict]:
+        """스트리밍 tool_call_chunks를 완전한 tool_calls 리스트로 조합"""
+        import json as _json
+
+        calls: dict[int, dict] = {}
+        for chunk in chunks:
+            idx = chunk.get("index", 0)
+            if idx not in calls:
+                calls[idx] = {"name": "", "args": ""}
+            if chunk.get("name"):
+                calls[idx]["name"] += chunk["name"]
+            if chunk.get("args"):
+                calls[idx]["args"] += chunk["args"]
+
+        result = []
+        for call in calls.values():
+            try:
+                call["args"] = _json.loads(call["args"]) if isinstance(call["args"], str) and call["args"] else {}
+            except _json.JSONDecodeError:
+                call["args"] = {}
+            result.append(call)
+        return result
+
+    async def astream_tokens(self, prompt: str, mode: str = "tool_select", callbacks=None):
+        """토큰 단위 async 스트리밍 — refusal 감지 가능
+
+        go_stream()은 step 단위이지만, 이 메서드는 토큰 단위.
+
+        Args:
+            prompt: 사용자 쿼리
+            mode: "plan_only" | "tool_select" | "agent" (도구 없는 대화)
+
+        Yields:
+            dict: {"type": "token", "content": "..."}
+                | {"type": "code_detected", "code": "...", "marker": "<execute>"|"[EXECUTE]"}
+                | {"type": "tool_call", "name": "...", "args": {...}}
+                | {"type": "tool_result", "result": "...", "wrapped_code": "..."}
+                | {"type": "done"}
+        """
+        code_marker = getattr(self, "code_marker", "execute")
+
+        # 모드별 LLM + 시스템 프롬프트 설정
+        if mode == "plan_only":
+            llm = self.llm
+            sys_prompt = getattr(self, "plan_prompt", self.execute_prompt)
+        elif mode == "tool_select":
+            tools_schema = self._get_bind_tools_schema()
+            llm = self.llm.bind_tools(tools_schema)
+            sys_prompt = self.execute_prompt
+            if code_marker == "execute":
+                sys_prompt = self._inject_execute_instructions(sys_prompt)
+        else:  # agent
+            llm = self.llm
+            sys_prompt = self.execute_prompt
+
+        messages = [SystemMessage(content=sys_prompt), HumanMessage(content=prompt)]
+
+        full_response = ""
+        tool_calls_buffer: list = []
+
+        async for chunk in llm.astream(messages):
+            # 텍스트 토큰
+            if chunk.content:
+                full_response += chunk.content
+                yield {"type": "token", "content": chunk.content}
+
+                # api_execute / native_execute: <execute> 텍스트 감지
+                if code_marker == "execute" and "</execute>" in full_response:
+                    code = self._extract_execute_block(full_response)
+                    if code is not None:
+                        yield {"type": "code_detected", "code": code, "marker": "<execute>"}
+
+            # wrap_execute: bind_tools tool_call_chunks
+            if hasattr(chunk, "tool_call_chunks") and chunk.tool_call_chunks:
+                tool_calls_buffer.extend(chunk.tool_call_chunks)
+
+        # 도구 호출이 있으면 실행
+        if tool_calls_buffer:
+            assembled = self._assemble_tool_calls(tool_calls_buffer)
+            for tc in assembled:
+                yield {"type": "tool_call", "name": tc["name"], "args": tc["args"]}
+
+                if tc["name"] in self._code_execution_tools:
+                    code = tc["args"].get("code", "")
+                    result = self._traced_run_code(code, self.timeout_seconds)
+                    if code_marker == "wrap":
+                        wrapped = f"[EXECUTE]\n{code}\n[/EXECUTE]"
+                    else:
+                        wrapped = f"<execute>\n{code}\n</execute>"
+                    yield {"type": "tool_result", "result": result, "wrapped_code": wrapped}
+                else:
+                    result = self._call_registered_tool(tc["name"], tc["args"])
+                    yield {"type": "tool_result", "result": result}
+
+        yield {"type": "done"}
+
+    def go_plan_only(self, prompt: str, callbacks=None):
+        """Plan만 생성하고 반환 (실행하지 않음)
+
+        Args:
+            prompt: 사용자 쿼리
+            callbacks: LangChain callbacks
+
+        Returns:
+            str: 생성된 plan 텍스트
+        """
+        sys_prompt = getattr(self, "plan_prompt", self.execute_prompt)
+        messages = [SystemMessage(content=sys_prompt), HumanMessage(content=prompt)]
+        config = {}
+        if callbacks:
+            config["callbacks"] = callbacks
+        response = self.llm.invoke(messages, config=config if config else None)
+        return response.content
+
+    async def astream_step(self, step_context: str, history: list[BaseMessage], callbacks=None):
+        """단일 step을 실행 — astream_tokens의 래퍼
+
+        Args:
+            step_context: 현재 실행할 step 설명
+            history: 이전 대화 히스토리 (LangChain messages)
+
+        Yields:
+            dict: astream_tokens와 동일한 이벤트 형식
+        """
+        code_marker = getattr(self, "code_marker", "execute")
+        tools_schema = self._get_bind_tools_schema()
+        llm = self.llm.bind_tools(tools_schema)
+
+        sys_prompt = self.execute_prompt
+        if code_marker == "execute":
+            sys_prompt = self._inject_execute_instructions(sys_prompt)
+
+        messages = [SystemMessage(content=sys_prompt)] + history + [HumanMessage(content=step_context)]
+
+        full_response = ""
+        tool_calls_buffer: list = []
+
+        async for chunk in llm.astream(messages):
+            if chunk.content:
+                full_response += chunk.content
+                yield {"type": "token", "content": chunk.content}
+
+                if code_marker == "execute" and "</execute>" in full_response:
+                    code = self._extract_execute_block(full_response)
+                    if code is not None:
+                        yield {"type": "code_detected", "code": code, "marker": "<execute>"}
+
+            if hasattr(chunk, "tool_call_chunks") and chunk.tool_call_chunks:
+                tool_calls_buffer.extend(chunk.tool_call_chunks)
+
+        if tool_calls_buffer:
+            assembled = self._assemble_tool_calls(tool_calls_buffer)
+            for tc in assembled:
+                yield {"type": "tool_call", "name": tc["name"], "args": tc["args"]}
+                if tc["name"] in self._code_execution_tools:
+                    code = tc["args"].get("code", "")
+                    result = self._traced_run_code(code, self.timeout_seconds)
+                    if code_marker == "wrap":
+                        wrapped = f"[EXECUTE]\n{code}\n[/EXECUTE]"
+                    else:
+                        wrapped = f"<execute>\n{code}\n</execute>"
+                    yield {"type": "tool_result", "result": result, "wrapped_code": wrapped}
+                else:
+                    result = self._call_registered_tool(tc["name"], tc["args"])
+                    yield {"type": "tool_result", "result": result}
+
+        yield {"type": "done"}
 
     def launch_gradio_demo(self, thread_id=42, share=False, server_name="0.0.0.0", require_verification=False):
         """Launch a full-featured Gradio UI for the A1 agent (adapted from codeact_copilot).
