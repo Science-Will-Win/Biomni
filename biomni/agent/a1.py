@@ -67,6 +67,7 @@ class A1:
         timeout_seconds: int | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
+        max_tokens: int | None = None,
         commercial_mode: bool | None = None,
         expected_data_lake_files: list | None = None,
     ):
@@ -80,6 +81,7 @@ class A1:
             timeout_seconds: Timeout for code execution in seconds
             base_url: Base URL for custom model serving (e.g., "http://localhost:8000/v1")
             api_key: API key for the custom LLM
+            max_tokens: Maximum generation tokens for the LLM
             commercial_mode: If True, excludes datasets that require commercial licenses or are non-commercial only
 
         """
@@ -204,6 +206,7 @@ class A1:
             source=source,
             base_url=base_url,
             api_key=api_key,
+            max_tokens=max_tokens,
             config=default_config,
         )
         self.module2api = module2api
@@ -1861,7 +1864,11 @@ For example: from [module_name] import [function_name]"""
         # Langfuse에 입력 프롬프트 기록
         langfuse_context.update_current_observation(
             input=prompt,
-            metadata={"session_id": session_id},
+            metadata={
+                "session_id": session_id,
+                "system_prompt": self.system_prompt, # 자르고 싶으면 "system_prompt": self.system_prompt[:3000],
+                },
+            
         )
 
         if self.use_tool_retriever:
@@ -1943,6 +1950,146 @@ For example: from [module_name] import [function_name]"""
 
         # Store the conversation state for markdown generation
         self._conversation_state = final_state
+
+    @staticmethod
+    def _looks_like_code(text: str) -> bool:
+        sample = text.strip()
+        if not sample or len(sample) < 8:
+            return False
+        code_markers = (
+            "import ",
+            "from ",
+            "print(",
+            "query_",
+            "pd.",
+            "for ",
+            "try:",
+            "except ",
+            "#!",
+        )
+        return any(marker in sample for marker in code_markers)
+
+    @staticmethod
+    def _extract_execute_block(text: str, allow_partial: bool = False) -> str | None:
+        """Extract runnable code from model execute formats.
+
+        Some vLLM chat templates surface the execute token as a special token
+        instead of the literal <execute> tag. During streaming we only trust
+        closed blocks; after streaming finishes, allow a conservative fallback.
+        """
+        patterns = [
+            r"<execute>(.*?)</execute>",
+            r"\[EXECUTE\](.*?)\[/EXECUTE\]",
+            r"<SPECIAL_855>(.*?)(?:</execute|</s>)",
+        ]
+        if allow_partial:
+            patterns.extend([
+                r"<execute>(.*)$",
+                r"<SPECIAL_855>(.*)$",
+            ])
+
+        for pattern in patterns:
+            match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+            if match:
+                code = match.group(1).strip()
+                code = re.sub(r"</?execute\s*>?", "", code, flags=re.IGNORECASE).strip()
+                code = re.sub(r"</s>\s*$", "", code, flags=re.IGNORECASE).strip()
+                if code:
+                    return code
+
+        if allow_partial:
+            for match in re.finditer(r"<SPECIAL_\d+>\s*([\s\S]*?)(?=<SPECIAL_\d+>|</s>|$)", text, re.DOTALL | re.IGNORECASE):
+                code = match.group(1).strip()
+                if A1._looks_like_code(code):
+                    return code
+
+            match = re.search(r"```(?:python|py|r|bash|sh)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+            if match:
+                code = match.group(1).strip()
+                if code:
+                    return code
+        return None
+
+    @staticmethod
+    def _normalize_stream_content(content) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    part = block.get("text") or block.get("content") or ""
+                    if isinstance(part, str):
+                        parts.append(part)
+            return "".join(parts)
+        return str(content) if content is not None else ""
+
+    def go_plan_only(self, prompt: str, callbacks: Callbacks = None):
+        """Generate only a plan for the supplied prompt.
+
+        The web backend calls this method for plan-mode sessions. Keep it scoped to
+        plan creation and let the backend execute each step separately.
+        """
+        plan_prompt = (
+            f"{self.system_prompt}\n\n"
+            "Your ONLY task now is to create a concise, executable plan for the user's request. "
+            "Return the plan as a numbered checklist and do not execute code."
+        )
+        messages = [SystemMessage(content=plan_prompt), HumanMessage(content=prompt)]
+        config = {"callbacks": callbacks} if callbacks else None
+        response = self.llm.invoke(messages, config=config)
+        return self._normalize_stream_content(getattr(response, "content", response))
+
+    async def astream_step(
+        self,
+        step_context: str,
+        history: list[BaseMessage],
+        callbacks: Callbacks = None,
+        execute_code: bool = True,
+    ):
+        """Stream a single plan step and execute <execute> blocks when they appear."""
+        step_prompt = (
+            f"{self.system_prompt}\n\n"
+            "When code execution is needed, wrap only the runnable code in <execute> and </execute> tags. "
+            "The system will execute it and return the observation."
+        )
+        messages = [SystemMessage(content=step_prompt)] + history + [HumanMessage(content=step_context)]
+        config = {"callbacks": callbacks} if callbacks else None
+
+        full_response = ""
+        executed_blocks: set[str] = set()
+
+        async for chunk in self.llm.astream(messages, config=config):
+            chunk_text = self._normalize_stream_content(getattr(chunk, "content", chunk))
+            if not chunk_text:
+                continue
+
+            full_response += chunk_text
+            yield {"type": "token", "content": chunk_text}
+
+            code = self._extract_execute_block(full_response) if execute_code else None
+            if code and code not in executed_blocks:
+                executed_blocks.add(code)
+                yield {
+                    "type": "tool_call",
+                    "name": "code_execution",
+                    "args": {"code": code},
+                }
+                result = self._traced_run_code(code, self.timeout_seconds)
+                yield {"type": "tool_result", "result": result}
+
+        code = self._extract_execute_block(full_response, allow_partial=True) if execute_code else None
+        if code and code not in executed_blocks:
+            executed_blocks.add(code)
+            yield {
+                "type": "tool_call",
+                "name": "code_execution",
+                "args": {"code": code},
+            }
+            result = self._traced_run_code(code, self.timeout_seconds)
+            yield {"type": "tool_result", "result": result}
+
+        yield {"type": "done"}
 
     def update_system_prompt_with_selected_resources(self, selected_resources):
         """Update the system prompt with the selected resources."""

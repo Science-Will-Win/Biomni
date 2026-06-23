@@ -13,6 +13,53 @@ from biomni.llm import get_llm
 from biomni.utils import parse_hpo_obo
 
 
+def _llm_content_to_text(content: Any) -> str:
+    """Normalize LangChain message content across chat and responses APIs."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks = []
+        for item in content:
+            if isinstance(item, str):
+                chunks.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content") or item.get("output_text")
+                if isinstance(text, dict):
+                    text = text.get("value") or text.get("text") or text.get("content")
+                if isinstance(text, list):
+                    text = _llm_content_to_text(text)
+                if text:
+                    chunks.append(str(text))
+            else:
+                chunks.append(str(item))
+        return "\n".join(chunk for chunk in chunks if chunk)
+    if isinstance(content, dict):
+        text = content.get("text") or content.get("content") or content.get("output_text")
+        if text is not None:
+            return _llm_content_to_text(text)
+    return str(content)
+
+
+def _llm_api_fallback_models(primary_model: str) -> list[str]:
+    """Return API-parsing fallback models, preserving order and uniqueness."""
+    configured = os.getenv("BIOMNI_LLM_FALLBACKS", "")
+    if configured.strip():
+        candidates = [m.strip() for m in configured.split(",") if m.strip()]
+    else:
+        candidates = ["gpt-4o", "claude-sonnet-4-5", "gemini-2.0-flash"]
+
+    models = [primary_model] + candidates
+    seen = set()
+    ordered = []
+    for model in models:
+        if model and model not in seen:
+            seen.add(model)
+            ordered.append(model)
+    return ordered
+
+
 # Function to map HPO terms to names
 def get_hpo_names(hpo_terms: list[str], data_lake_path: str) -> list[str]:
     """Retrieve the names of given HPO terms.
@@ -59,63 +106,91 @@ def _query_llm_for_api(prompt, schema, system_template):
         model = "claude-3-5-haiku-20241022"
         api_key = None
 
-    try:
-        # Format the system prompt with schema if provided
-        if schema is not None:
-            schema_json = json.dumps(schema, indent=2)
-            system_prompt = system_template.format(schema=schema_json)
-        else:
-            system_prompt = system_template
+    # Format the system prompt with schema if provided
+    if schema is not None:
+        schema_json = json.dumps(schema, indent=2)
+        system_prompt = system_template.format(schema=schema_json)
+    else:
+        system_prompt = system_template
 
-        # Get LLM instance using the unified interface with config
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=prompt),
+    ]
+
+    attempts = []
+    for attempt_model in _llm_api_fallback_models(model):
+        llm_text = ""
+        json_start = -1
+        json_end = -1
         try:
-            from biomni.config import default_config
+            # Get LLM instance using the unified interface with config.
+            try:
+                from biomni.config import default_config
 
-            llm = get_llm(model=model, temperature=0.0, api_key=api_key, config=default_config)
-        except ImportError:
-            llm = get_llm(model=model, temperature=0.0, api_key=api_key or "EMPTY")
+                llm = get_llm(
+                    model=attempt_model,
+                    temperature=0.0,
+                    api_key=api_key,
+                    config=default_config,
+                )
+            except ImportError:
+                llm = get_llm(model=attempt_model, temperature=0.0, api_key=api_key or "EMPTY")
 
-        # Compose messages
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=prompt),
-        ]
+            response = llm.invoke(messages)
+            llm_text = _llm_content_to_text(getattr(response, "content", response)).strip()
 
-        # Query the LLM
-        response = llm.invoke(messages)
-        llm_text = response.content.strip()
+            # Find JSON boundaries (in case LLM adds explanations)
+            json_start = llm_text.find("{")
+            json_end = llm_text.rfind("}") + 1
 
-        # Find JSON boundaries (in case LLM adds explanations)
-        json_start = llm_text.find("{")
-        json_end = llm_text.rfind("}") + 1
-
-        if json_start >= 0 and json_end > json_start:
-            json_text = llm_text[json_start:json_end]
-            result = json.loads(json_text)
-        else:
-            # If no JSON found, try the whole response
-            result = json.loads(llm_text)
-
-        return {"success": True, "data": result, "raw_response": llm_text}
-
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-        # Try ast.literal_eval for Python-style dict (single quotes from local models)
-        import ast
-        try:
             if json_start >= 0 and json_end > json_start:
-                result = ast.literal_eval(llm_text[json_start:json_end])
+                json_text = llm_text[json_start:json_end]
+                result = json.loads(json_text)
             else:
-                result = ast.literal_eval(llm_text)
-            return {"success": True, "data": result, "raw_response": llm_text}
-        except Exception:
-            pass
-        return {
-            "success": False,
-            "error": f"API Schema parsing failed: {str(e)}",
-            "raw_response": llm_text if "llm_text" in locals() else "",
-        }
-    except Exception as e:
-        return {"success": False, "error": f"Error querying LLM: {str(e)}"}
+                result = json.loads(llm_text)
+
+            return {
+                "success": True,
+                "data": result,
+                "raw_response": llm_text,
+                "model_used": attempt_model,
+                "fallback_attempts": attempts,
+            }
+
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            import ast
+
+            try:
+                if json_start >= 0 and json_end > json_start:
+                    result = ast.literal_eval(llm_text[json_start:json_end])
+                else:
+                    result = ast.literal_eval(llm_text)
+                return {
+                    "success": True,
+                    "data": result,
+                    "raw_response": llm_text,
+                    "model_used": attempt_model,
+                    "fallback_attempts": attempts,
+                }
+            except Exception:
+                attempts.append(
+                    {
+                        "model": attempt_model,
+                        "error": f"API Schema parsing failed: {str(e)}",
+                        "raw_response": llm_text,
+                    }
+                )
+        except Exception as e:
+            attempts.append({"model": attempt_model, "error": f"Error querying LLM: {str(e)}"})
+
+    last = attempts[-1] if attempts else {"error": "No LLM models attempted"}
+    return {
+        "success": False,
+        "error": last["error"],
+        "raw_response": last.get("raw_response", ""),
+        "fallback_attempts": attempts,
+    }
 
 def _query_rest_api(endpoint, method="GET", params=None, headers=None, json_data=None, description=None):
     """General helper function to query REST APIs with consistent error handling.
@@ -2758,6 +2833,12 @@ def query_gwas_catalog(
 
     # Execute the GWAS Catalog API request using the helper function
     api_result = _query_rest_api(endpoint=url, method="GET", params=params, description=description)
+    if prompt:
+        api_result["llm_query_info"] = {
+            "model_used": llm_result.get("model_used"),
+            "fallback_attempts": llm_result.get("fallback_attempts", []),
+            "description": description,
+        }
 
     return api_result
 
