@@ -4,11 +4,11 @@ from hashlib import sha256
 from neo4j import GraphDatabase
 
 class GraphMemory:
-    def __init__(self):
+    def __init__(self, uri=None, user=None, password=None):
         # 도커 환경변수 우선 적용
-        self.user = os.getenv("NEO4J_USER", "neo4j")
-        self.password = os.getenv("NEO4J_PASSWORD", "biomnipassword")
-        configured_uri = os.getenv("NEO4J_URI")
+        self.user = user or os.getenv("NEO4J_USER", "neo4j")
+        self.password = password or os.getenv("NEO4J_PASSWORD", "biomnipassword")
+        configured_uri = uri or os.getenv("NEO4J_URI")
         candidates = [
             configured_uri,
             "bolt://neo4j:7687",
