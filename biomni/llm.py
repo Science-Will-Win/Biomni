@@ -1,5 +1,5 @@
 import os
-from typing import TYPE_CHECKING, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
@@ -8,6 +8,102 @@ if TYPE_CHECKING:
 
 SourceType = Literal["OpenAI", "AzureOpenAI", "Anthropic", "Ollama", "Gemini", "Bedrock", "Groq", "Custom"]
 ALLOWED_SOURCES: set[str] = set(SourceType.__args__)
+
+RAW_RESPONSE_EXTRA_KEYS = (
+    "id",
+    "object",
+    "created",
+    "model",
+    "service_tier",
+    "system_fingerprint",
+    "usage",
+    "prompt_logprobs",
+    "prompt_token_ids",
+    "prompt_text",
+    "kv_transfer_params",
+    "ec_transfer_params",
+    "metrics",
+)
+
+RAW_CHOICE_EXTRA_KEYS = (
+    "uncertainty",
+    "lm_head_variance",
+    "token_ids",
+    "routed_experts",
+    "stop_reason",
+)
+
+
+def _response_to_dict(response: Any) -> dict[str, Any]:
+    if isinstance(response, dict):
+        return response
+    if hasattr(response, "model_dump"):
+        try:
+            return response.model_dump()
+        except Exception:
+            return {}
+    return {}
+
+
+def _chat_openai_preserving_raw_extras(ChatOpenAI):
+    class _ChatOpenAIPreserveRawExtras(ChatOpenAI):
+        def _create_chat_result(self, response, generation_info=None):  # type: ignore[override]
+            response_dict = _response_to_dict(response)
+            chat_result = super()._create_chat_result(response, generation_info)
+            raw_response = response_dict if response_dict else {}
+            extras = {
+                key: response_dict[key]
+                for key in RAW_RESPONSE_EXTRA_KEYS
+                if key in response_dict and response_dict[key] is not None
+            }
+            choices = response_dict.get("choices") or []
+            choice_extras = []
+            if isinstance(choices, list):
+                for choice in choices:
+                    if not isinstance(choice, dict):
+                        choice_extras.append({})
+                        continue
+                    choice_extras.append(
+                        {
+                            key: choice[key]
+                            for key in RAW_CHOICE_EXTRA_KEYS
+                            if key in choice and choice[key] is not None
+                        }
+                    )
+
+            first_choice_extras = choice_extras[0] if choice_extras else {}
+            if not raw_response and not extras and not first_choice_extras:
+                return chat_result
+
+            chat_result.llm_output = dict(chat_result.llm_output or {})
+            if raw_response:
+                chat_result.llm_output["raw_response"] = raw_response
+            if extras:
+                chat_result.llm_output["raw_response_extras"] = extras
+            if first_choice_extras:
+                chat_result.llm_output["raw_choice_extras"] = first_choice_extras
+            if "uncertainty" in first_choice_extras:
+                chat_result.llm_output["uncertainty"] = first_choice_extras["uncertainty"]
+            if "lm_head_variance" in first_choice_extras:
+                chat_result.llm_output["lm_head_variance"] = first_choice_extras["lm_head_variance"]
+
+            for index, generation in enumerate(getattr(chat_result, "generations", []) or []):
+                generation.generation_info = dict(generation.generation_info or {})
+                if raw_response:
+                    generation.generation_info["raw_response"] = raw_response
+                if extras:
+                    generation.generation_info["raw_response_extras"] = extras
+                per_choice_extras = choice_extras[index] if index < len(choice_extras) else {}
+                if per_choice_extras:
+                    generation.generation_info["raw_choice_extras"] = per_choice_extras
+                if "uncertainty" in per_choice_extras:
+                    generation.generation_info["uncertainty"] = per_choice_extras["uncertainty"]
+                if "lm_head_variance" in per_choice_extras:
+                    generation.generation_info["lm_head_variance"] = per_choice_extras["lm_head_variance"]
+
+            return chat_result
+
+    return _ChatOpenAIPreserveRawExtras
 
 
 def get_llm(
@@ -259,10 +355,11 @@ def get_llm(
         except ImportError:
             raise ImportError(  # noqa: B904
                 "langchain-openai package is required for custom models. Install with: pip install langchain-openai"
-            )
+        )
         # Custom LLM serving such as SGLang. Must expose an openai compatible API.
         assert base_url is not None, "base_url must be provided for customly served LLMs"
-        llm = ChatOpenAI(
+        ChatOpenAIPreserveRawExtras = _chat_openai_preserving_raw_extras(ChatOpenAI)
+        llm = ChatOpenAIPreserveRawExtras(
             model=model,
             temperature=temperature,
             max_tokens=max_tokens or 8192,
@@ -270,7 +367,7 @@ def get_llm(
             base_url=base_url,
             api_key=api_key,
             streaming=True,
-            model_kwargs={"extra_body": {"skip_special_tokens": False}},
+            extra_body={"skip_special_tokens": False},
         )
         return llm
 

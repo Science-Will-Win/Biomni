@@ -349,7 +349,62 @@ class GraphMemory:
         trace_id=None,
         metadata=None,
     ):
-        metadata_json = json.dumps(metadata or {}, ensure_ascii=False, default=str)
+        metadata_obj = metadata or {}
+        llm_capture = metadata_obj.get("llm_capture") or {}
+        llm_capture_options = metadata_obj.get("llm_capture_options") or {}
+        uncertainty_head = llm_capture_options.get("uncertainty_head") or {}
+        plan_llm_capture = metadata_obj.get("plan_llm_capture") or {}
+        plan_raw_response = metadata_obj.get("plan_raw_response") or ""
+        response_metadata = llm_capture.get("response_metadata") if isinstance(llm_capture, dict) else {}
+        additional_kwargs = llm_capture.get("additional_kwargs") if isinstance(llm_capture, dict) else {}
+        usage_metadata = llm_capture.get("usage_metadata") if isinstance(llm_capture, dict) else {}
+        plan_response_metadata = (
+            plan_llm_capture.get("response_metadata")
+            if isinstance(plan_llm_capture, dict)
+            else {}
+        )
+        plan_additional_kwargs = (
+            plan_llm_capture.get("additional_kwargs")
+            if isinstance(plan_llm_capture, dict)
+            else {}
+        )
+        if not isinstance(plan_response_metadata, dict):
+            plan_response_metadata = {}
+        if not isinstance(plan_additional_kwargs, dict):
+            plan_additional_kwargs = {}
+        if not isinstance(response_metadata, dict):
+            response_metadata = {}
+        if not isinstance(additional_kwargs, dict):
+            additional_kwargs = {}
+        if not isinstance(usage_metadata, dict):
+            usage_metadata = {}
+        raw_response = response_metadata.get("raw_response") or additional_kwargs.get("raw_response") or {}
+        plan_raw_response_json_obj = (
+            plan_response_metadata.get("raw_response")
+            or plan_additional_kwargs.get("raw_response")
+            or {}
+        )
+        raw_response_extras = (
+            response_metadata.get("raw_response_extras")
+            or additional_kwargs.get("raw_response_extras")
+            or {}
+        )
+        raw_choice_extras = (
+            response_metadata.get("raw_choice_extras")
+            or additional_kwargs.get("raw_choice_extras")
+            or {}
+        )
+        metadata_json = json.dumps(metadata_obj, ensure_ascii=False, default=str)
+        llm_capture_json = json.dumps(llm_capture, ensure_ascii=False, default=str)
+        plan_llm_capture_json = json.dumps(plan_llm_capture, ensure_ascii=False, default=str)
+        plan_raw_response_json = json.dumps(plan_raw_response_json_obj, ensure_ascii=False, default=str)
+        uncertainty_head_json = json.dumps(uncertainty_head, ensure_ascii=False, default=str)
+        response_metadata_json = json.dumps(response_metadata, ensure_ascii=False, default=str)
+        additional_kwargs_json = json.dumps(additional_kwargs, ensure_ascii=False, default=str)
+        usage_metadata_json = json.dumps(usage_metadata, ensure_ascii=False, default=str)
+        raw_response_json = json.dumps(raw_response, ensure_ascii=False, default=str)
+        raw_response_extras_json = json.dumps(raw_response_extras, ensure_ascii=False, default=str)
+        raw_choice_extras_json = json.dumps(raw_choice_extras, ensure_ascii=False, default=str)
         result_json = json.dumps(final_result or {}, ensure_ascii=False, default=str)
         trajectory = (
             f"Task: {task_name}\n"
@@ -369,6 +424,9 @@ class GraphMemory:
         MERGE (r:Run {conv_id: $run_id})
         SET r.trace_id = $trace_id,
             r.success = coalesce(r.success, false) OR $success,
+            r.plan_raw_response = $plan_raw_response,
+            r.plan_llm_capture_json = $plan_llm_capture_json,
+            r.plan_raw_response_json = $plan_raw_response_json,
             r.updated_at = datetime()
         MERGE (t)-[:HAS_RUN]->(r)
         MERGE (s:Step {run_id: $run_id, index: $step_index})
@@ -381,6 +439,17 @@ class GraphMemory:
         MERGE (lc:LLMCall {id: $llm_id})
         SET lc.system_prompt = $system_prompt,
             lc.answer = $full_response,
+            lc.metadata_json = $metadata_json,
+            lc.llm_capture_json = $llm_capture_json,
+            lc.response_metadata_json = $response_metadata_json,
+            lc.additional_kwargs_json = $additional_kwargs_json,
+            lc.usage_metadata_json = $usage_metadata_json,
+            lc.raw_response_json = $raw_response_json,
+            lc.raw_response_extras_json = $raw_response_extras_json,
+            lc.raw_choice_extras_json = $raw_choice_extras_json,
+            lc.uncertainty_mode = $uncertainty_mode,
+            lc.uncertainty_label = $uncertainty_label,
+            lc.uncertainty_head_json = $uncertainty_head_json,
             lc.phase = 'step',
             lc.updated_at = datetime()
         MERGE (s)-[:HAS_LLM_CALL]->(lc)
@@ -416,6 +485,19 @@ class GraphMemory:
                 obs_id=obs_id,
                 trace_id=trace_id,
                 metadata_json=metadata_json,
+                llm_capture_json=llm_capture_json,
+                plan_raw_response=plan_raw_response,
+                plan_llm_capture_json=plan_llm_capture_json,
+                plan_raw_response_json=plan_raw_response_json,
+                response_metadata_json=response_metadata_json,
+                additional_kwargs_json=additional_kwargs_json,
+                usage_metadata_json=usage_metadata_json,
+                raw_response_json=raw_response_json,
+                raw_response_extras_json=raw_response_extras_json,
+                raw_choice_extras_json=raw_choice_extras_json,
+                uncertainty_mode=str(llm_capture_options.get("mode", "")),
+                uncertainty_label=str(llm_capture_options.get("label", "")),
+                uncertainty_head_json=uncertainty_head_json,
             )
             session.run(
                 """

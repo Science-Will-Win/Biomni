@@ -1,6 +1,7 @@
 import glob
 import inspect
 import uuid
+import asyncio
 import os
 import re
 from collections.abc import Generator
@@ -2024,6 +2025,35 @@ For example: from [module_name] import [function_name]"""
             return "".join(parts)
         return str(content) if content is not None else ""
 
+    @staticmethod
+    def _jsonable_capture(value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {str(k): A1._jsonable_capture(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [A1._jsonable_capture(v) for v in value]
+        if hasattr(value, "model_dump"):
+            try:
+                return A1._jsonable_capture(value.model_dump())
+            except Exception:
+                pass
+        if hasattr(value, "dict"):
+            try:
+                return A1._jsonable_capture(value.dict())
+            except Exception:
+                pass
+        return str(value)
+
+    @classmethod
+    def _extract_llm_capture(cls, chunk: Any) -> dict[str, Any]:
+        capture: dict[str, Any] = {}
+        for attr in ("response_metadata", "additional_kwargs", "usage_metadata"):
+            value = getattr(chunk, attr, None)
+            if value:
+                capture[attr] = cls._jsonable_capture(value)
+        return capture
+
     def go_plan_only(self, prompt: str, callbacks: Callbacks = None):
         """Generate only a plan for the supplied prompt.
 
@@ -2038,6 +2068,7 @@ For example: from [module_name] import [function_name]"""
         messages = [SystemMessage(content=plan_prompt), HumanMessage(content=prompt)]
         config = {"callbacks": callbacks} if callbacks else None
         response = self.llm.invoke(messages, config=config)
+        self._last_plan_llm_capture = self._extract_llm_capture(response)
         return self._normalize_stream_content(getattr(response, "content", response))
 
     async def astream_step(
@@ -2059,24 +2090,46 @@ For example: from [module_name] import [function_name]"""
         full_response = ""
         executed_blocks: set[str] = set()
 
-        async for chunk in self.llm.astream(messages, config=config):
-            chunk_text = self._normalize_stream_content(getattr(chunk, "content", chunk))
-            if not chunk_text:
-                continue
+        capture_options = getattr(self, "_llm_capture_options", {}) or {}
+        use_stream = capture_options.get("stream")
 
-            full_response += chunk_text
-            yield {"type": "token", "content": chunk_text}
+        if capture_options.get("enabled") and use_stream is False:
+            response = await asyncio.to_thread(self.llm.invoke, messages, config=config)
+            chunk_text = self._normalize_stream_content(getattr(response, "content", response))
+            llm_capture = self._extract_llm_capture(response)
+            if chunk_text:
+                full_response += chunk_text
+                token_event = {"type": "token", "content": chunk_text}
+                if llm_capture:
+                    token_event["llm_capture"] = llm_capture
+                yield token_event
+            elif llm_capture:
+                yield {"type": "llm_capture", "llm_capture": llm_capture}
+        else:
+            async for chunk in self.llm.astream(messages, config=config):
+                chunk_text = self._normalize_stream_content(getattr(chunk, "content", chunk))
+                llm_capture = self._extract_llm_capture(chunk)
+                if not chunk_text:
+                    if llm_capture:
+                        yield {"type": "llm_capture", "llm_capture": llm_capture}
+                    continue
 
-            code = self._extract_execute_block(full_response) if execute_code else None
-            if code and code not in executed_blocks:
-                executed_blocks.add(code)
-                yield {
-                    "type": "tool_call",
-                    "name": "code_execution",
-                    "args": {"code": code},
-                }
-                result = self._traced_run_code(code, self.timeout_seconds)
-                yield {"type": "tool_result", "result": result}
+                full_response += chunk_text
+                token_event = {"type": "token", "content": chunk_text}
+                if llm_capture:
+                    token_event["llm_capture"] = llm_capture
+                yield token_event
+
+                code = self._extract_execute_block(full_response) if execute_code else None
+                if code and code not in executed_blocks:
+                    executed_blocks.add(code)
+                    yield {
+                        "type": "tool_call",
+                        "name": "code_execution",
+                        "args": {"code": code},
+                    }
+                    result = self._traced_run_code(code, self.timeout_seconds)
+                    yield {"type": "tool_result", "result": result}
 
         code = self._extract_execute_block(full_response, allow_partial=True) if execute_code else None
         if code and code not in executed_blocks:
